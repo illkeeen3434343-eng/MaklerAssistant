@@ -301,6 +301,41 @@ PHONE_CHOICES = [
     "text=Telefon nömrəsi",
 ]
 
+# Submit-button candidates, tried in order. The auth page may not use a real
+# type=submit button, so we cover common Azerbaijani button labels too, and
+# fall back to pressing Enter in the field (submits almost any web form).
+SUBMIT_BUTTONS = [
+    "button[type='submit']",
+    "input[type='submit']",
+    "button:has-text('Davam')",     # "Davam et" = Continue
+    "button:has-text('Daxil ol')",  # "Log in"
+    "button:has-text('Təsdiq')",    # "Confirm"
+    "button:has-text('Göndər')",    # "Send"
+    "button:has-text('İrəli')",     # "Next"
+    "[role='button']:has-text('Davam')",
+]
+
+
+async def submit_form(page, field, extra_selectors: list[str] | None = None) -> bool:
+    """Submit the current step: try known buttons, else press Enter.
+
+    `field` is the input we just filled — pressing Enter in it submits most
+    forms even when there is no clickable button, or the button is disabled
+    until a JS validation pass we can trigger with a keypress.
+    """
+    candidates = (extra_selectors or []) + SUBMIT_BUTTONS
+    if await _click_first(page, candidates, timeout=3000):
+        log("Submitted via a button")
+        return True
+    # Fallback: press Enter in the field.
+    try:
+        log("No submit button matched — pressing Enter in the field")
+        await field.press("Enter")
+        return True
+    except Exception as exc:
+        log(f"Enter fallback failed: {exc}")
+        return False
+
 
 async def open_auth_modal(page) -> bool:
     """Open the hello.bina.az login page and get a phone input on screen.
@@ -548,7 +583,8 @@ async def run_login() -> int:
             await asyncio.sleep(1)
 
             log("Submitting phone number")
-            await page.locator(SELECTORS["phone_submit"]).first.click()
+            phone_submit_pref = [SELECTORS["phone_submit"]] if SELECTORS.get("phone_submit") else []
+            await submit_form(page, field, phone_submit_pref)
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
             log(f"After submit, URL: {page.url}")
@@ -581,10 +617,8 @@ async def run_login() -> int:
             await otp_field.fill("")
             await otp_field.type(code, delay=110)
             await asyncio.sleep(1)
-            try:
-                await page.locator(SELECTORS["otp_submit"]).first.click(timeout=5000)
-            except Exception:
-                log("No submit button clicked — form may auto-submit")
+            otp_submit_pref = [SELECTORS["otp_submit"]] if SELECTORS.get("otp_submit") else []
+            await submit_form(page, otp_field, otp_submit_pref)
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(2)
             log(f"After OTP, URL: {page.url}")
