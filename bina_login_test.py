@@ -54,29 +54,37 @@ def env_or(name: str, default: str) -> str:
     return val.strip() if val.strip() else default
 
 
-# bina.az login is a MODAL opened by the #authentication hash, not a page.
-# /login returns a 404. Loading the homepage with the hash pops the modal.
+# bina.az login is a SEPARATE auth service. Clicking "Giriş" on bina.az
+# redirects the browser to hello.bina.az/?return_to=<base64 of return url>.
+# That page hosts the phone/email choice and the phone + OTP inputs. We can
+# navigate straight to it instead of clicking through the homepage.
+import base64 as _b64
+
+RETURN_TO = env_or("RETURN_TO", "https://bina.az/")
+_RT_B64 = _b64.urlsafe_b64encode(RETURN_TO.encode()).decode().rstrip("=")
 HOME_URL = env_or("HOME_URL", "https://bina.az/")
-LOGIN_URL = env_or("LOGIN_URL", "https://bina.az/#authentication")
+AUTH_URL = env_or("AUTH_URL", f"https://hello.bina.az/?return_to={_RT_B64}")
+LOGIN_URL = AUTH_URL  # backward-compat alias
 MY_ITEMS_URL = env_or("MY_ITEMS_URL", "https://bina.az/items/my")
 
 # Selectors. Every one can be overridden by an env var of the same name,
 # so you can fix them from the workflow inputs without editing this file.
 # A blank override falls back to the default here (see env_or above).
 #
-# The flow is: open modal -> click "phone number" choice -> enter phone
-# (local, no leading 0) -> submit -> enter OTP -> submit.
+# The flow is: open hello.bina.az -> (maybe click "phone number" choice) ->
+# enter phone (local, no leading 0) -> submit -> enter OTP -> submit.
 SELECTORS = {
-    # Opens the auth modal if the hash alone didn't. Broad, best-effort.
-    "login_trigger": env_or("SEL_LOGIN_TRIGGER",
-                            "a[href*='authentication'], [class*='login'], text=Giriş"),
-    # The "log in with phone number" button inside the modal.
-    "phone_choice": env_or("SEL_PHONE_CHOICE", "text=Telefon nömrəsi ilə giriş"),
+    # Fallback only: the Giriş button on bina.az, in case direct navigation
+    # to hello.bina.az is ever redirected away. Uses the real data-cy hook.
+    "login_trigger": env_or("SEL_LOGIN_TRIGGER", "button[data-cy='header-profile-btn']"),
+    # The "log in with phone number" choice on hello.bina.az (may not exist
+    # if the phone field is shown by default).
+    "phone_choice": env_or("SEL_PHONE_CHOICE", "text=Telefon nömrəsi"),
     "phone_input": env_or("SEL_PHONE_INPUT",
-                          "input[type='tel'], input[name*='phone'], input[name='login']"),
+                          "input[type='tel'], input[name*='phone'], input[name*='number'], input[name='login']"),
     "phone_submit": env_or("SEL_PHONE_SUBMIT", "button[type='submit']"),
     "otp_input": env_or("SEL_OTP_INPUT",
-                        "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code']"),
+                        "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code'], input[inputmode='numeric']"),
     "otp_submit": env_or("SEL_OTP_SUBMIT", "button[type='submit']"),
     "otp_error": env_or("SEL_OTP_ERROR", ".error, .invalid-feedback, [role='alert']"),
     "logged_in": env_or("SEL_LOGGED_IN", "a[href*='logout'], a[href*='/users/'], text=Çıxış"),
@@ -256,50 +264,90 @@ async def looks_blocked(page) -> bool:
     ])
 
 
-async def open_auth_modal(page) -> bool:
-    """Open the #authentication modal and select phone-number login.
+async def _click_first(page, selectors: list[str], timeout: int = 4000) -> bool:
+    """Try each selector in turn; click the first visible match.
 
-    Returns True once a phone input is visible. bina.az's login is a modal,
-    not a page: loading the homepage with the #authentication hash usually
-    pops it. If not, we click a login trigger. Then we click the
-    'phone number' choice so the phone field appears.
+    Each selector is tried SEPARATELY. Playwright does not allow mixing the
+    text= engine with CSS in one comma-joined string (that yields a parse
+    error / count -2), so candidates must be a list, not a comma list.
     """
-    log(f"Opening {LOGIN_URL}")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    for sel in selectors:
+        if not sel:
+            continue
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible(timeout=timeout):
+                await loc.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# Candidate selectors for the two modal controls, tried in order. The first
+# in each list is the stable data-cy hook seen in the real page markup.
+LOGIN_TRIGGERS = [
+    SELECTORS["login_trigger"],                    # your override, if any
+    "button[data-cy='header-profile-btn']",        # the real Giriş button
+    "[data-stat='header-profile-btn']",
+    "button:has-text('Giriş')",
+    "text=Giriş",
+]
+PHONE_CHOICES = [
+    SELECTORS["phone_choice"],                     # your override, if any
+    "button:has-text('Telefon nömrəsi')",
+    "a:has-text('Telefon nömrəsi')",
+    "text=Telefon nömrəsi ilə giriş",
+    "text=Telefon nömrəsi",
+]
+
+
+async def open_auth_modal(page) -> bool:
+    """Open the hello.bina.az login page and get a phone input on screen.
+
+    Login lives on a SEPARATE service. We navigate straight to
+    hello.bina.az/?return_to=… . If the phone field isn't immediately shown
+    (some flows show a phone/email choice first), we click the phone choice.
+    A homepage→Giriş click is kept only as a fallback.
+
+    Returns True once a phone input is visible.
+    """
+    log(f"Opening auth page {AUTH_URL}")
+    resp = await page.goto(AUTH_URL, wait_until="domcontentloaded")
+    log(f"HTTP {resp.status if resp else '?'} — landed on {page.url}")
     await page.wait_for_load_state("networkidle")
-    await asyncio.sleep(2)
+    await asyncio.sleep(1.5)
 
     if await looks_blocked(page):
         return False
 
-    # If the phone input is already right there, we're done.
+    await dump(page, "auth-page")
+
+    # Phone field already there? Done.
     if await _visible(page, SELECTORS["phone_input"]):
-        log("Phone input already visible")
+        log("Phone input visible on the auth page")
         return True
 
-    # Otherwise make sure the modal is open.
-    if not await _visible(page, SELECTORS["phone_choice"]):
-        log("Modal not open from hash — trying the login trigger")
-        try:
-            trg = page.locator(SELECTORS["login_trigger"]).first
-            if await trg.count() and await trg.is_visible():
-                await trg.click()
-                await asyncio.sleep(1.5)
-        except Exception as exc:
-            log(f"  login trigger click failed: {exc}")
+    # Otherwise there may be a phone/email choice to click first.
+    log("No phone input yet — trying the 'phone number' choice")
+    await _click_first(page, PHONE_CHOICES)
+    await asyncio.sleep(1.5)
+    if await _visible(page, SELECTORS["phone_input"], timeout=6000):
+        return True
 
-    await dump(page, "modal-opened")
+    # Fallback: maybe we were bounced to bina.az; click Giriş to be redirected.
+    if "hello.bina.az" not in page.url:
+        log("Not on hello.bina.az — falling back to clicking Giriş on the homepage")
+        await page.goto(HOME_URL, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle")
+        await asyncio.sleep(1.5)
+        await _click_first(page, LOGIN_TRIGGERS)
+        await asyncio.sleep(2.0)
+        await dump(page, "after-giris-click")
+        await _click_first(page, PHONE_CHOICES)
+        await asyncio.sleep(1.5)
 
-    # Click the 'phone number' choice if the phone field isn't showing yet.
-    if not await _visible(page, SELECTORS["phone_input"]):
-        log("Selecting the phone-number login option")
-        try:
-            await page.locator(SELECTORS["phone_choice"]).first.click(timeout=5000)
-            await asyncio.sleep(1.5)
-        except Exception as exc:
-            log(f"  phone-choice click failed: {exc}")
-
-    return await _visible(page, SELECTORS["phone_input"], timeout=5000)
+    return await _visible(page, SELECTORS["phone_input"], timeout=6000)
 
 
 # ---------------------------------------------------------------------------
@@ -319,16 +367,17 @@ async def run_probe() -> int:
         )
         page = await ctx.new_page()
 
-        log(f"Opening homepage {HOME_URL}")
-        resp = await page.goto(HOME_URL, wait_until="domcontentloaded")
+        log(f"Opening auth page {AUTH_URL}")
+        resp = await page.goto(AUTH_URL, wait_until="domcontentloaded")
         status = resp.status if resp else 0
-        log(f"HTTP {status} — title: {(await page.title())!r}")
+        log(f"HTTP {status} — landed on {page.url}")
+        log(f"Title: {(await page.title())!r}")
 
         if await looks_blocked(page) or status in (403, 429, 503):
             log("")
-            log("🚨 LOOKS BLOCKED. bina.az served a challenge instead of the page.")
+            log("🚨 LOOKS BLOCKED. hello.bina.az served a challenge instead of the page.")
             log("   See the README section 'If the probe says BLOCKED'.")
-            await dump(page, "probe-homepage")
+            await dump(page, "probe-blocked")
             await browser.close()
             return 1
 
@@ -356,6 +405,7 @@ async def run_probe() -> int:
                         type: el.getAttribute('type') || '',
                         name: el.getAttribute('name') || '',
                         placeholder: el.getAttribute('placeholder') || '',
+                        dataCy: el.getAttribute('data-cy') || '',
                         text: (el.textContent || '').trim().slice(0, 30),
                     });
                 }
@@ -368,6 +418,8 @@ async def run_probe() -> int:
                 desc += f" type={e['type']}"
             if e["name"]:
                 desc += f" name={e['name']}"
+            if e["dataCy"]:
+                desc += f" data-cy={e['dataCy']}"
             if e["placeholder"]:
                 desc += f" placeholder={e['placeholder']!r}"
             desc += ">"
@@ -631,7 +683,7 @@ def preflight() -> None:
             problems.append("TELEGRAM_USER_ID must be numeric (get it from @userinfobot)")
     # Guard against an empty required selector reaching Playwright, which
     # produces the cryptic 'unexpected token "" while parsing selector ""'.
-    for key in ("phone_choice", "phone_input", "phone_submit", "otp_input", "logged_in"):
+    for key in ("phone_input", "phone_submit", "otp_input", "logged_in"):
         if not SELECTORS.get(key):
             problems.append(f"selector '{key}' is empty — leave its override blank to use the default")
     if problems:
