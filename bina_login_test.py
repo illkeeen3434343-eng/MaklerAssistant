@@ -54,16 +54,29 @@ def env_or(name: str, default: str) -> str:
     return val.strip() if val.strip() else default
 
 
-LOGIN_URL = env_or("LOGIN_URL", "https://bina.az/login")
+# bina.az login is a MODAL opened by the #authentication hash, not a page.
+# /login returns a 404. Loading the homepage with the hash pops the modal.
+HOME_URL = env_or("HOME_URL", "https://bina.az/")
+LOGIN_URL = env_or("LOGIN_URL", "https://bina.az/#authentication")
 MY_ITEMS_URL = env_or("MY_ITEMS_URL", "https://bina.az/items/my")
 
 # Selectors. Every one can be overridden by an env var of the same name,
 # so you can fix them from the workflow inputs without editing this file.
 # A blank override falls back to the default here (see env_or above).
+#
+# The flow is: open modal -> click "phone number" choice -> enter phone
+# (local, no leading 0) -> submit -> enter OTP -> submit.
 SELECTORS = {
-    "phone_input": env_or("SEL_PHONE_INPUT", "input[name='phone'], input[type='tel']"),
+    # Opens the auth modal if the hash alone didn't. Broad, best-effort.
+    "login_trigger": env_or("SEL_LOGIN_TRIGGER",
+                            "a[href*='authentication'], [class*='login'], text=Giriş"),
+    # The "log in with phone number" button inside the modal.
+    "phone_choice": env_or("SEL_PHONE_CHOICE", "text=Telefon nömrəsi ilə giriş"),
+    "phone_input": env_or("SEL_PHONE_INPUT",
+                          "input[type='tel'], input[name*='phone'], input[name='login']"),
     "phone_submit": env_or("SEL_PHONE_SUBMIT", "button[type='submit']"),
-    "otp_input": env_or("SEL_OTP_INPUT", "input[name='code'], input[name='otp']"),
+    "otp_input": env_or("SEL_OTP_INPUT",
+                        "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code']"),
     "otp_submit": env_or("SEL_OTP_SUBMIT", "button[type='submit']"),
     "otp_error": env_or("SEL_OTP_ERROR", ".error, .invalid-feedback, [role='alert']"),
     "logged_in": env_or("SEL_LOGGED_IN", "a[href*='logout'], a[href*='/users/'], text=Çıxış"),
@@ -83,9 +96,26 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def bina_local(phone: str) -> str:
+    """Reduce any phone form to the 9-digit local number bina.az expects.
+
+    bina.az's field wants the number WITHOUT the leading 0 and without a
+    country code:  0557778899  ->  557778899  ->  as typed.
+    Accepts +994557778899, 994557778899, 0557778899, or 557778899.
+    """
+    d = re.sub(r"\D", "", phone)
+    if d.startswith("994") and len(d) >= 12:
+        d = d[3:]
+    if d.startswith("0"):
+        d = d[1:]
+    return d
+
+
 def mask(phone: str) -> str:
     d = re.sub(r"\D", "", phone)
-    return f"+{d[:4]}***{d[-4:]}" if len(d) > 8 else "+***"
+    if len(d) >= 5:
+        return d[:2] + "*" * (len(d) - 4) + d[-2:]
+    return "***"
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +239,69 @@ async def dump(page, name: str) -> Path:
     return png
 
 
+async def _visible(page, sel: str, timeout: int = 2500) -> bool:
+    if not sel:
+        return False
+    try:
+        return await page.locator(sel).first.is_visible(timeout=timeout)
+    except Exception:
+        return False
+
+
+async def looks_blocked(page) -> bool:
+    body = (await page.content()).lower()
+    return any(s in body for s in [
+        "cf-challenge", "just a moment", "checking your browser",
+        "captcha", "access denied", "attention required",
+    ])
+
+
+async def open_auth_modal(page) -> bool:
+    """Open the #authentication modal and select phone-number login.
+
+    Returns True once a phone input is visible. bina.az's login is a modal,
+    not a page: loading the homepage with the #authentication hash usually
+    pops it. If not, we click a login trigger. Then we click the
+    'phone number' choice so the phone field appears.
+    """
+    log(f"Opening {LOGIN_URL}")
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle")
+    await asyncio.sleep(2)
+
+    if await looks_blocked(page):
+        return False
+
+    # If the phone input is already right there, we're done.
+    if await _visible(page, SELECTORS["phone_input"]):
+        log("Phone input already visible")
+        return True
+
+    # Otherwise make sure the modal is open.
+    if not await _visible(page, SELECTORS["phone_choice"]):
+        log("Modal not open from hash — trying the login trigger")
+        try:
+            trg = page.locator(SELECTORS["login_trigger"]).first
+            if await trg.count() and await trg.is_visible():
+                await trg.click()
+                await asyncio.sleep(1.5)
+        except Exception as exc:
+            log(f"  login trigger click failed: {exc}")
+
+    await dump(page, "modal-opened")
+
+    # Click the 'phone number' choice if the phone field isn't showing yet.
+    if not await _visible(page, SELECTORS["phone_input"]):
+        log("Selecting the phone-number login option")
+        try:
+            await page.locator(SELECTORS["phone_choice"]).first.click(timeout=5000)
+            await asyncio.sleep(1.5)
+        except Exception as exc:
+            log(f"  phone-choice click failed: {exc}")
+
+    return await _visible(page, SELECTORS["phone_input"], timeout=5000)
+
+
 # ---------------------------------------------------------------------------
 # Mode: probe
 # ---------------------------------------------------------------------------
@@ -226,41 +319,83 @@ async def run_probe() -> int:
         )
         page = await ctx.new_page()
 
-        log(f"Opening {LOGIN_URL}")
-        resp = await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        log(f"Opening homepage {HOME_URL}")
+        resp = await page.goto(HOME_URL, wait_until="domcontentloaded")
         status = resp.status if resp else 0
-        title = await page.title()
-        log(f"HTTP {status} — title: {title!r}")
-        log(f"Final URL: {page.url}")
+        log(f"HTTP {status} — title: {(await page.title())!r}")
 
-        body = (await page.content()).lower()
-        blocked = any(s in body for s in [
-            "cf-challenge", "cloudflare", "just a moment",
-            "checking your browser", "captcha", "access denied",
-        ])
-        if blocked or status in (403, 429, 503):
+        if await looks_blocked(page) or status in (403, 429, 503):
             log("")
-            log("🚨 LOOKS BLOCKED. bina.az served a challenge page instead of")
-            log("   the login form. This is the datacenter-IP problem — see")
-            log("   the README section 'If the probe says BLOCKED'.")
+            log("🚨 LOOKS BLOCKED. bina.az served a challenge instead of the page.")
+            log("   See the README section 'If the probe says BLOCKED'.")
+            await dump(page, "probe-homepage")
+            await browser.close()
+            return 1
 
-        log("\nSelector check on the login page:")
-        found = await probe_selectors(page, ["phone_input", "phone_submit", "cookie_accept"])
-        await dump(page, "probe-login-page")
+        # Open the auth modal and select phone login.
+        opened = await open_auth_modal(page)
+        await dump(page, "probe-modal")
+
+        log("\nSelector check inside the login modal:")
+        found = await probe_selectors(
+            page,
+            ["login_trigger", "phone_choice", "phone_input", "phone_submit"],
+        )
+
+        # Extract every input/button in the modal so you can read the real
+        # attributes straight from the log, without opening the HTML file.
+        log("\nInputs and buttons currently on the page:")
+        elements = await page.evaluate(
+            """() => {
+                const out = [];
+                for (const el of document.querySelectorAll('input, button, [type=submit]')) {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    out.push({
+                        tag: el.tagName,
+                        type: el.getAttribute('type') || '',
+                        name: el.getAttribute('name') || '',
+                        placeholder: el.getAttribute('placeholder') || '',
+                        text: (el.textContent || '').trim().slice(0, 30),
+                    });
+                }
+                return out;
+            }"""
+        )
+        for e in elements[:40]:
+            desc = f"<{e['tag']}"
+            if e["type"]:
+                desc += f" type={e['type']}"
+            if e["name"]:
+                desc += f" name={e['name']}"
+            if e["placeholder"]:
+                desc += f" placeholder={e['placeholder']!r}"
+            desc += ">"
+            if e["text"]:
+                desc += f"  “{e['text']}”"
+            log(f"  {desc}")
 
         (ART / "probe-result.json").write_text(json.dumps({
-            "status": status, "title": title, "url": page.url,
-            "blocked": blocked, "selectors": found,
+            "homepage_status": status,
+            "modal_opened": opened,
+            "selectors": found,
+            "visible_elements": elements,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
 
         await browser.close()
 
-        ok = (not blocked) and found.get("phone_input", 0) > 0
         log("")
-        log("✅ Probe OK — the login form is reachable and the phone input was found."
-            if ok else
-            "❌ Probe failed — read artifacts/probe-login-page.html to find the right selectors.")
-        return 0 if ok else 1
+        ok = opened and found.get("phone_input", 0) > 0
+        if ok:
+            log("=========================================")
+            log("  ✅  LOGIN MODAL REACHED, phone input found")
+            log("=========================================")
+            log("  The datacenter IP is NOT blocked. Run mode=login next.")
+            return 0
+        log("❌ Could not reach a phone input in the modal.")
+        log("   Open artifacts/probe-modal.html (and probe-modal.png) and use the")
+        log("   'Inputs and buttons' list above to set the right selector overrides.")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -290,27 +425,48 @@ async def run_login() -> int:
         try:
             # ---------------- step 1: phone number ----------------
             if BINA_PHONE:
-                phone = BINA_PHONE
-                log(f"Using phone from secret: {mask(phone)}")
-                await tg.send(f"Using the phone number from your repo secret: <b>{mask(phone)}</b>")
+                raw_phone = BINA_PHONE
+                log(f"Using phone from secret: {mask(raw_phone)}")
+                await tg.send(f"Using the phone number from your repo secret: "
+                              f"<b>{mask(raw_phone)}</b>")
             else:
-                await tg.send("📱 Send me the phone number of your bina.az account\n"
-                              "(e.g. <code>+994501234567</code>)")
-                phone = await tg.wait_for_text(PHONE_WAIT)
-                log(f"Phone received: {mask(phone)}")
+                await tg.send(
+                    "📱 Send me your bina.az phone number.\n"
+                    "Just the number as you type it on the site, e.g. "
+                    "<code>0557778899</code> or <code>557778899</code>."
+                )
+                raw_phone = await tg.wait_for_text(PHONE_WAIT)
+                log(f"Phone received: {mask(raw_phone)}")
 
-            # ---------------- step 2: open login page ----------------
-            log(f"Opening {LOGIN_URL}")
-            resp = await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-            log(f"HTTP {resp.status if resp else '?'} — {page.url}")
+            phone = bina_local(raw_phone)   # -> 9-digit local, no leading 0
+            log(f"Normalized to bina.az local form: {mask(phone)} ({len(phone)} digits)")
+            if len(phone) != 9:
+                await tg.send(
+                    f"⚠️ After normalizing I got <b>{len(phone)}</b> digits "
+                    f"(<code>{mask(phone)}</code>), but bina.az expects 9 "
+                    "(like <code>557778899</code>). Continuing anyway — if it "
+                    "fails, resend the number."
+                )
 
-            body = (await page.content()).lower()
-            if any(s in body for s in ["just a moment", "checking your browser", "cf-challenge"]):
+            # ---------------- step 2: open modal, choose phone ----------------
+            opened = await open_auth_modal(page)
+            if await looks_blocked(page):
                 await dump(page, "blocked")
-                await tg.send("🚨 bina.az served a Cloudflare challenge instead of the "
-                              "login page. GitHub's IP is being blocked.\n\n"
-                              "This is the expected failure mode — see the README.")
+                await tg.send("🚨 bina.az served a Cloudflare challenge instead of "
+                              "the login modal. GitHub's IP is being blocked.")
                 return 2
+            if not opened:
+                await dump(page, "no-modal")
+                await tg.send(
+                    "❌ Opened the page but couldn't get a phone input in the "
+                    "login modal.\n"
+                    f"Phone-choice selector: <code>{SELECTORS['phone_choice']}</code>\n"
+                    f"Phone-input selector: <code>{SELECTORS['phone_input']}</code>\n\n"
+                    "Run <b>probe</b> mode — it lists the real inputs/buttons — "
+                    "then set the selector overrides and retry."
+                )
+                return 3
+            log(f"Login modal ready at {page.url}")
 
             if SELECTORS["cookie_accept"]:
                 try:
@@ -475,7 +631,7 @@ def preflight() -> None:
             problems.append("TELEGRAM_USER_ID must be numeric (get it from @userinfobot)")
     # Guard against an empty required selector reaching Playwright, which
     # produces the cryptic 'unexpected token "" while parsing selector ""'.
-    for key in ("phone_input", "phone_submit", "otp_input", "logged_in"):
+    for key in ("phone_choice", "phone_input", "phone_submit", "otp_input", "logged_in"):
         if not SELECTORS.get(key):
             problems.append(f"selector '{key}' is empty — leave its override blank to use the default")
     if problems:

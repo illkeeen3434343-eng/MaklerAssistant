@@ -6,12 +6,13 @@ A minimal, manually-triggered test that proves one thing end to end:
 
 It runs entirely inside GitHub Actions. There is no server, no database, and
 nothing is saved — the browser session is destroyed the moment the job ends.
-The point is to answer a single question: **does bina.az's OTP login work from
-a GitHub runner's IP, or does Cloudflare block it?**
 
-You already know from your `binaizleme` work that bina.az's *read* endpoints
-respond to datacenter IPs. Login pages are usually guarded more tightly, so
-this is worth finding out before you build anything on top of it.
+**Confirmed:** bina.az does **not** block GitHub's datacenter IP — a probe run
+reached the site normally (a real bina.az 404, not a Cloudflare challenge). So
+the login flow *can* run from Actions. The one wrinkle we found: bina.az's login
+is a **modal** opened by the `#authentication` hash, not a page — `/login`
+returns 404. The script now opens that modal, picks the phone-number option, and
+enters the number in bina.az's local format (no leading zero).
 
 ---
 
@@ -23,9 +24,10 @@ GitHub Actions runner                 You (Telegram)              bina.az
 start job (Actions tab)
    │
    ├─ "send me your phone"  ──────────────►
-   │                          +99450…  ◄──── you type it
-   ├─ open login page ───────────────────────────────────────────►
-   ├─ submit phone ──────────────────────────────────────────────►
+   │                        557778899  ◄──── you type it (no leading 0)
+   ├─ open #authentication modal ────────────────────────────────►
+   ├─ click "Telefon nömrəsi ilə giriş" ─────────────────────────►
+   ├─ enter phone, submit ───────────────────────────────────────►
    │                                          SMS ◄──── to your phone
    ├─ "send me the code"  ─────────────────►
    │                            4821    ◄──── you type it
@@ -33,6 +35,11 @@ start job (Actions tab)
    ├─ open "my ads", check we're logged in ──────────────────────►
    └─ "✅ Login successful"  ─────────────►
 ```
+
+**Phone format:** bina.az's field wants the local number without the leading
+zero — you'd type `557778899` for `055 777 88 99`. The script accepts any form
+(`0557778899`, `+994557778899`, `557778899`) and normalizes it, so don't worry
+about which you send.
 
 The runner talks to you through a Telegram bot using plain long-polling — no
 framework. It only ever accepts messages from **your** Telegram user ID.
@@ -45,15 +52,18 @@ Run them in this order.
 
 ### 1. `probe` — no login, no Telegram needed
 
-Loads the bina.az login page from the runner and reports:
+Loads the homepage, opens the `#authentication` login modal, selects the
+phone-number option, and reports:
 
-- the HTTP status and page title,
-- whether it looks like a Cloudflare challenge (the blocking you're testing for),
-- whether the phone-input selector matches,
-- the full page HTML + a screenshot, saved as downloadable artifacts.
+- whether it looks like a Cloudflare challenge (already confirmed: it isn't),
+- whether the modal opened and the phone input was found,
+- **a printed list of every visible input and button** in the modal, with their
+  `name`/`type`/`placeholder` — so you can read the real selectors straight from
+  the run log,
+- the full modal HTML + a screenshot, saved as downloadable artifacts.
 
-Run this first. If it says **BLOCKED**, you have your answer without spending an
-SMS or your time — and the artifacts show you exactly what the runner received.
+Run this first. It costs no SMS and confirms the selectors before you spend a
+real login attempt.
 
 ### 2. `login` — the real test
 
@@ -100,11 +110,12 @@ secret**. Add:
 |---|---|---|
 | `BOT_TOKEN` | The token from BotFather | Yes |
 | `TELEGRAM_USER_ID` | Your numeric ID from userinfobot | Yes |
-| `BINA_PHONE` | Your bina.az phone, e.g. `+994501234567` | Optional — see note |
+| `BINA_PHONE` | Your bina.az phone, e.g. `557778899` (any form works) | Optional — see note |
 
 > **`BINA_PHONE` is optional.** If you set it, the bot uses it automatically and
 > only asks you for the SMS code. If you leave it out, the bot asks for the
-> phone number in the chat too. For a quick test, setting it is smoother.
+> phone number in the chat too. You can store it as `557778899`, `0557778899`,
+> or `+994557778899` — the script normalizes to what bina.az's field expects.
 
 That's it. No secret is ever printed in the logs, and your phone number is
 masked (`+9945***4567`) everywhere it appears.
@@ -146,16 +157,25 @@ Send `/cancel` at any time to abort.
 
 ## Fixing selectors
 
-The selectors shipped here are **educated guesses**. bina.az may use different
-ones, and you fix them without editing any code — through the workflow inputs.
+The selectors shipped here are **educated guesses** for the modal. If a login
+run can't find the phone choice or input, you fix it without editing code —
+through the workflow inputs.
 
-1. From a `probe` (or a failed `login`) run, download the artifacts:
-   the run page → **Artifacts** → `bina-debug-…`.
-2. Open the relevant `.html` file and its `.png` screenshot.
-3. Find the real element. For example, search the HTML for `type="tel"` or
-   `name="phone"` to find the phone field. Look at what actually wraps it.
-4. Re-run the workflow and paste the correct CSS selector into the matching
-   input box (**Override: phone input selector**, etc).
+1. Run `probe`. Its log prints a **list of every visible input and button** in
+   the modal, like:
+   ```
+   <INPUT type=tel name=phone placeholder='55 777 88 99'>
+   <BUTTON>  "Telefon nömrəsi ilə giriş"
+   <BUTTON type=submit>  "Davam et"
+   ```
+   That's usually enough to pick the right selector directly.
+2. For the full picture, download the artifacts (run page → **Artifacts** →
+   `bina-debug-…`) and open `probe-modal.html` / `probe-modal.png`.
+3. Re-run with the correct CSS selector pasted into the matching input box.
+
+The overridable selectors now include the **login trigger** (opens the modal)
+and the **phone choice** ("log in with phone number" button), plus phone input,
+phone submit, OTP input, OTP submit, and the logged-in marker.
 
 Selector tips:
 
