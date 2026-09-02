@@ -42,19 +42,33 @@ SAVE_SUCCESS_SCREENSHOT = os.getenv("SAVE_SUCCESS_SCREENSHOT", "false").lower() 
 ART = Path("artifacts")
 ART.mkdir(exist_ok=True)
 
-LOGIN_URL = os.getenv("LOGIN_URL", "https://bina.az/login")
-MY_ITEMS_URL = os.getenv("MY_ITEMS_URL", "https://bina.az/items/my")
+def env_or(name: str, default: str) -> str:
+    """Like os.getenv, but an EMPTY value also falls back to the default.
+
+    GitHub Actions passes an unset workflow input as an empty string, not as
+    an absent variable. os.getenv only uses its default when the variable is
+    absent, so a blank override box would otherwise wipe out the fallback and
+    hand Playwright an empty '' selector.
+    """
+    val = os.getenv(name, "")
+    return val.strip() if val.strip() else default
+
+
+LOGIN_URL = env_or("LOGIN_URL", "https://bina.az/login")
+MY_ITEMS_URL = env_or("MY_ITEMS_URL", "https://bina.az/items/my")
 
 # Selectors. Every one can be overridden by an env var of the same name,
 # so you can fix them from the workflow inputs without editing this file.
+# A blank override falls back to the default here (see env_or above).
 SELECTORS = {
-    "phone_input": os.getenv("SEL_PHONE_INPUT", "input[name='phone'], input[type='tel']"),
-    "phone_submit": os.getenv("SEL_PHONE_SUBMIT", "button[type='submit']"),
-    "otp_input": os.getenv("SEL_OTP_INPUT", "input[name='code'], input[name='otp']"),
-    "otp_submit": os.getenv("SEL_OTP_SUBMIT", "button[type='submit']"),
-    "otp_error": os.getenv("SEL_OTP_ERROR", ".error, .invalid-feedback, [role='alert']"),
-    "logged_in": os.getenv("SEL_LOGGED_IN", "a[href*='logout'], a[href*='/users/'], text=Çıxış"),
-    "cookie_accept": os.getenv("SEL_COOKIE_ACCEPT", ""),
+    "phone_input": env_or("SEL_PHONE_INPUT", "input[name='phone'], input[type='tel']"),
+    "phone_submit": env_or("SEL_PHONE_SUBMIT", "button[type='submit']"),
+    "otp_input": env_or("SEL_OTP_INPUT", "input[name='code'], input[name='otp']"),
+    "otp_submit": env_or("SEL_OTP_SUBMIT", "button[type='submit']"),
+    "otp_error": env_or("SEL_OTP_ERROR", ".error, .invalid-feedback, [role='alert']"),
+    "logged_in": env_or("SEL_LOGGED_IN", "a[href*='logout'], a[href*='/users/'], text=Çıxış"),
+    # cookie_accept has no default — empty means "no banner", which is valid.
+    "cookie_accept": os.getenv("SEL_COOKIE_ACCEPT", "").strip(),
 }
 
 USER_AGENT = (
@@ -459,6 +473,11 @@ def preflight() -> None:
             problems.append("TELEGRAM_USER_ID secret is missing")
         elif not TELEGRAM_USER_ID.isdigit():
             problems.append("TELEGRAM_USER_ID must be numeric (get it from @userinfobot)")
+    # Guard against an empty required selector reaching Playwright, which
+    # produces the cryptic 'unexpected token "" while parsing selector ""'.
+    for key in ("phone_input", "phone_submit", "otp_input", "logged_in"):
+        if not SELECTORS.get(key):
+            problems.append(f"selector '{key}' is empty — leave its override blank to use the default")
     if problems:
         print("\n❌ Cannot start:\n")
         for p in problems:
