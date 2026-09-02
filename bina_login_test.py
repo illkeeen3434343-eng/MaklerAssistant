@@ -90,7 +90,8 @@ SELECTORS = {
                         "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code'], input[inputmode='numeric']"),
     "otp_submit": env_or("SEL_OTP_SUBMIT", "button[type='submit']"),
     "otp_error": env_or("SEL_OTP_ERROR", ".error, .invalid-feedback, [role='alert']"),
-    "logged_in": env_or("SEL_LOGGED_IN", "a[href*='logout'], a[href*='/users/'], text=Çıxış"),
+    "logged_in": env_or("SEL_LOGGED_IN",
+                        "a[href*='/profile'], a[href*='/items/my'], a[href*='logout']"),
     # cookie_accept has no default — empty means "no banner", which is valid.
     "cookie_accept": os.getenv("SEL_COOKIE_ACCEPT", "").strip(),
 }
@@ -711,8 +712,13 @@ async def run_login() -> int:
             except Exception:
                 pass
 
-            redirected_to_login = "login" in final_url.lower()
-            success = (not redirected_to_login) and marker_count > 0
+            # The strongest signal: we asked for /items/my (a page that only
+            # exists when authenticated) and we STAYED there, rather than being
+            # bounced to the login/auth service. The marker is a bonus check.
+            low = final_url.lower()
+            bounced = ("login" in low) or ("hello.bina.az" in low) or ("authentication" in low)
+            stayed_on_my_items = "/items/my" in low
+            success = (not bounced) and (stayed_on_my_items or marker_count > 0)
 
             png = await dump(page, "final-state")
 
@@ -725,7 +731,8 @@ async def run_login() -> int:
                     "✅ <b>Login successful!</b>\n\n"
                     f"Account: <b>{mask(phone)}</b>\n"
                     f"Landed on: <code>{final_url}</code>\n"
-                    f"Logged-in marker: {marker_count} match(es)\n\n"
+                    f"Confirmed by: {'staying on /items/my' if stayed_on_my_items else 'logged-in marker'}"
+                    f" (marker: {marker_count} match)\n\n"
                     "The full flow works: phone → SMS → code → authenticated session.\n\n"
                     "⚠️ <i>This session is destroyed when the Actions job ends. "
                     "Nothing is saved.</i>"
@@ -748,7 +755,7 @@ async def run_login() -> int:
             await tg.send(
                 "❌ <b>Login did not complete.</b>\n\n"
                 f"Final URL: <code>{final_url}</code>\n"
-                f"Redirected to login: {redirected_to_login}\n"
+                f"Bounced to login/auth: {bounced}\n"
                 f"Logged-in marker: {marker_count} match(es)\n"
                 + (f"Page error: <i>{err_text}</i>\n" if err_text else "") +
                 "\nDownload the run artifacts and open <code>final-state.html</code>.\n"
