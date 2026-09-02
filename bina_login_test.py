@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -81,8 +82,10 @@ SELECTORS = {
     # if the phone field is shown by default).
     "phone_choice": env_or("SEL_PHONE_CHOICE", "text=Telefon nömrəsi"),
     "phone_input": env_or("SEL_PHONE_INPUT",
-                          "input[type='tel'], input[name*='phone'], input[name*='number'], input[name='login']"),
-    "phone_submit": env_or("SEL_PHONE_SUBMIT", "button[type='submit']"),
+                          "#phone-field, input[type='tel'], input[name*='phone'], input[name*='number']"),
+    # The real button is <button type=button> with this text; it starts
+    # 'disabled' until the phone number is valid.
+    "phone_submit": env_or("SEL_PHONE_SUBMIT", "button:has-text('SMS-kod')"),
     "otp_input": env_or("SEL_OTP_INPUT",
                         "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code'], input[inputmode='numeric']"),
     "otp_submit": env_or("SEL_OTP_SUBMIT", "button[type='submit']"),
@@ -305,12 +308,13 @@ PHONE_CHOICES = [
 # type=submit button, so we cover common Azerbaijani button labels too, and
 # fall back to pressing Enter in the field (submits almost any web form).
 SUBMIT_BUTTONS = [
+    "button:has-text('SMS-kod')",   # hello.bina.az "SMS-kod göndərilsin"
     "button[type='submit']",
     "input[type='submit']",
     "button:has-text('Davam')",     # "Davam et" = Continue
     "button:has-text('Daxil ol')",  # "Log in"
     "button:has-text('Təsdiq')",    # "Confirm"
-    "button:has-text('Göndər')",    # "Send"
+    "button:has-text('Göndər')",    # "Send" / "göndərilsin"
     "button:has-text('İrəli')",     # "Next"
     "[role='button']:has-text('Davam')",
 ]
@@ -335,6 +339,67 @@ async def submit_form(page, field, extra_selectors: list[str] | None = None) -> 
     except Exception as exc:
         log(f"Enter fallback failed: {exc}")
         return False
+
+
+async def type_phone_masked(page, field, digits: str) -> str:
+    """Type a phone number into a masked field, keystroke by keystroke.
+
+    hello.bina.az's field is pre-filled with a '(0' mask and formats input
+    via JS as you type. fill() bypasses that JS and corrupts the value, so we
+    type through the real keyboard instead. We first clear whatever is there
+    (select-all + Backspace), then send each digit with a small delay so the
+    mask's input handler runs for every keystroke.
+
+    Returns the field's resulting value (for logging/debugging).
+    """
+    await field.click()
+    try:
+        await field.press("Control+A")
+        await field.press("Backspace")
+    except Exception:
+        pass
+    for _ in range(6):
+        try:
+            await field.press("Backspace")
+        except Exception:
+            break
+    for ch in digits:
+        await page.keyboard.type(ch, delay=random.randint(60, 130))
+    await asyncio.sleep(0.4)
+    try:
+        return await field.input_value()
+    except Exception:
+        return ""
+
+
+async def wait_button_enabled(page, selectors: list[str], timeout: int = 8000) -> bool:
+    """Wait until a submit button is present AND not disabled.
+
+    The button starts with class '... disabled'; JS toggles it once the
+    number validates. We poll the DOM 'disabled' property and the class list.
+    """
+    deadline = time.time() + timeout / 1000
+    while time.time() < deadline:
+        for sel in selectors:
+            if not sel:
+                continue
+            try:
+                loc = page.locator(sel).first
+                if not await loc.count():
+                    continue
+                state = await loc.evaluate(
+                    """el => ({
+                        disabledAttr: el.disabled === true,
+                        disabledClass: el.className.includes('disabled'),
+                        visible: !!(el.offsetParent || el.getClientRects().length),
+                    })"""
+                )
+                if state["visible"] and not state["disabledAttr"] and not state["disabledClass"]:
+                    return True
+            except Exception:
+                continue
+        await asyncio.sleep(0.4)
+    return False
 
 
 async def open_auth_modal(page) -> bool:
@@ -577,10 +642,20 @@ async def run_login() -> int:
                               "look at <code>no-phone-input.html</code>.")
                 return 3
 
-            await field.click()
-            await field.fill("")
-            await field.type(phone, delay=90)
-            await asyncio.sleep(1)
+            result_value = await type_phone_masked(page, field, phone)
+            log(f"Field value after typing: {result_value!r}")
+            # Sanity check: did our digits actually land?
+            digits_in_field = re.sub(r"\D", "", result_value)
+            if phone not in digits_in_field:
+                log("⚠️ Typed digits not fully reflected in the field — "
+                    "the mask may need a different approach.")
+                await dump(page, "phone-value-mismatch")
+
+            log("Waiting for the submit button to become enabled…")
+            submit_sel = [SELECTORS["phone_submit"]] + SUBMIT_BUTTONS
+            enabled = await wait_button_enabled(page, submit_sel, timeout=8000)
+            if not enabled:
+                log("Button still disabled — will try submitting anyway")
 
             log("Submitting phone number")
             phone_submit_pref = [SELECTORS["phone_submit"]] if SELECTORS.get("phone_submit") else []
