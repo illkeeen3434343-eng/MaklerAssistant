@@ -1,0 +1,104 @@
+name: bina.az login test
+
+# Manual trigger only. This never runs on push, on a schedule, or on a PR.
+# You start it by hand from the Actions tab when you are ready to receive
+# the SMS code on your phone.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe = check selectors only | login = full login test"
+        required: true
+        default: probe
+        type: choice
+        options: [probe, login]
+
+      sel_phone_input:
+        description: "Override: phone input selector"
+        required: false
+        default: ""
+      sel_phone_submit:
+        description: "Override: phone submit button selector"
+        required: false
+        default: ""
+      sel_otp_input:
+        description: "Override: OTP input selector"
+        required: false
+        default: ""
+      sel_otp_submit:
+        description: "Override: OTP submit button selector"
+        required: false
+        default: ""
+      sel_logged_in:
+        description: "Override: logged-in marker selector"
+        required: false
+        default: ""
+
+      save_success_screenshot:
+        description: "Send the logged-in screenshot to Telegram (contains personal data)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+# Two runs polling the same bot token at once causes Telegram HTTP 409.
+concurrency:
+  group: bina-login-test
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Hard cap. If you walk away, the job dies instead of burning minutes.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run test
+        env:
+          MODE: ${{ inputs.mode }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          BINA_PHONE: ${{ secrets.BINA_PHONE }}
+          SAVE_SUCCESS_SCREENSHOT: ${{ inputs.save_success_screenshot }}
+          SEL_PHONE_INPUT: ${{ inputs.sel_phone_input }}
+          SEL_PHONE_SUBMIT: ${{ inputs.sel_phone_submit }}
+          SEL_OTP_INPUT: ${{ inputs.sel_otp_input }}
+          SEL_OTP_SUBMIT: ${{ inputs.sel_otp_submit }}
+          SEL_LOGGED_IN: ${{ inputs.sel_logged_in }}
+          PHONE_WAIT: "180"
+          OTP_WAIT: "300"
+        run: python bina_login_test.py
+
+      # Always upload, especially on failure — this is how you debug.
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bina-debug-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 3
+          if-no-files-found: warn
