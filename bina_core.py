@@ -20,6 +20,8 @@ from typing import Awaitable, Callable
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+import security
+
 # --------------------------------------------------------------------------
 # Config (env-overridable, same defaults the login test converged on)
 # --------------------------------------------------------------------------
@@ -91,13 +93,16 @@ class OtpRejected(Exception):
 
 
 class BinaSession:
-    """One persistent browser context for one bina.az phone number."""
+    """One persistent browser context for one (owner_id, phone) pair."""
 
-    def __init__(self, phone: str):
+    def __init__(self, phone: str, owner_id: int):
         self.phone = phone
+        self.owner_id = owner_id
         self.local = bina_local(phone)
         safe = re.sub(r"\D", "", phone)
-        self.session_file = SESSIONS_DIR / f"{safe}.json"
+        # Session files are namespaced per owner AND encrypted per owner, so
+        # one user can never read or reuse another user's session.
+        self.session_file = SESSIONS_DIR / str(owner_id) / f"{safe}.enc"
         self._pw = None
         self._browser = None
         self._ctx = None
@@ -117,8 +122,10 @@ class BinaSession:
         state = None
         if self.session_file.exists():
             try:
-                state = json.loads(self.session_file.read_text())
-                _log(f"loaded saved session for {mask(self.phone)}")
+                raw = security.decrypt(self.owner_id, self.session_file.read_bytes())
+                if raw:
+                    state = json.loads(raw)
+                    _log(f"loaded saved session for {mask(self.phone)}")
             except Exception:
                 state = None
         self._ctx = await self._browser.new_context(
@@ -141,16 +148,17 @@ class BinaSession:
         self._ctx = self._browser = self._pw = self._page = None
 
     async def _save(self) -> None:
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        self.session_file.parent.mkdir(parents=True, exist_ok=True)
         state = await self._ctx.storage_state()
+        blob = security.encrypt(self.owner_id, json.dumps(state).encode())
         tmp = self.session_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state))
+        tmp.write_bytes(blob)
         os.replace(tmp, self.session_file)
         try:
             os.chmod(self.session_file, 0o600)
         except OSError:
             pass
-        _log(f"session saved for {mask(self.phone)}")
+        _log(f"session saved for {mask(self.phone)} (owner {self.owner_id})")
 
     def forget(self) -> None:
         if self.session_file.exists():

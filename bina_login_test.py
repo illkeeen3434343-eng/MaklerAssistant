@@ -164,11 +164,24 @@ class Telegram:
             log(f"WARN could not send screenshot: {exc}")
 
     async def drain(self) -> None:
-        """Skip messages sent before this run started."""
-        r = await self.http.get(f"{API}/getUpdates", params={"timeout": 0})
-        data = r.json()
-        if data.get("ok") and data["result"]:
-            self.offset = data["result"][-1]["update_id"] + 1
+        """Discard ALL messages sent before this run started.
+
+        Loops until getUpdates returns nothing, advancing the offset each
+        time. A single poll can miss a stale message (the 'hi' you sent to
+        initialise the bot), which would then be mistaken for your OTP.
+        """
+        for _ in range(10):
+            try:
+                r = await self.http.get(
+                    f"{API}/getUpdates",
+                    params={"offset": self.offset, "timeout": 0},
+                )
+                result = r.json().get("result", [])
+            except Exception:
+                break
+            if not result:
+                break
+            self.offset = result[-1]["update_id"] + 1
         log(f"Telegram drained, offset={self.offset}")
 
     async def wait_for_text(self, timeout: int) -> str:
@@ -221,6 +234,66 @@ class Telegram:
                     pass
                 return text
         raise TimeoutError(f"No reply within {timeout}s")
+
+    async def wait_for_code(self, timeout: int, min_digits: int = 4) -> str:
+        """Wait for an SMS code, ignoring anything that isn't one.
+
+        Only a message with >= min_digits digits is accepted. Non-code
+        messages (a stray 'hi', a question, a leftover message) are skipped
+        and we KEEP WAITING up to the full timeout — they no longer abort the
+        run. Returns the digits.
+        """
+        deadline = time.time() + timeout
+        nudged = False
+        while time.time() < deadline:
+            remaining = int(deadline - time.time())
+            try:
+                r = await self.http.get(
+                    f"{API}/getUpdates",
+                    params={"offset": self.offset,
+                            "timeout": min(30, max(1, remaining))},
+                )
+                data = r.json()
+            except Exception as exc:
+                log(f"getUpdates error: {exc}")
+                await asyncio.sleep(2)
+                continue
+            if not data.get("ok"):
+                await asyncio.sleep(2)
+                continue
+
+            for upd in data["result"]:
+                self.offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                sender = str((msg.get("from") or {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+                if not text or sender != self.chat_id:
+                    continue
+                if text.lower() in {"/cancel", "/stop"}:
+                    raise KeyboardInterrupt("cancelled by user")
+
+                digits = re.sub(r"\D", "", text)
+                if len(digits) < min_digits:
+                    # Not a code — ignore and keep waiting.
+                    if not nudged:
+                        await self.send(
+                            "🤔 That doesn't look like the code. Send the "
+                            "digits from the bina.az SMS. Still waiting…"
+                        )
+                        nudged = True
+                    continue
+
+                await self.send("🔑 Code received, thanks.")
+                try:
+                    await self.http.post(
+                        f"{API}/deleteMessage",
+                        json={"chat_id": self.chat_id,
+                              "message_id": msg["message_id"]},
+                    )
+                except Exception:
+                    pass
+                return digits
+        raise TimeoutError(f"No code within {timeout}s")
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +760,12 @@ async def run_login() -> int:
 
             await tg.send(f"📲 bina.az should have texted a code to <b>{mask(phone)}</b>.\n\n"
                           "Send me the code.")
-            code = await tg.wait_for_text(OTP_WAIT)
-            code = re.sub(r"\D", "", code)
-            log(f"Code received ({len(code)} digits)")
-            if not code:
-                await tg.send("❌ That contained no digits. Aborting.")
+            try:
+                code = await tg.wait_for_code(OTP_WAIT)
+            except TimeoutError:
+                await tg.send(f"⏰ No code received within {OTP_WAIT}s. Stopping.")
                 return 5
+            log(f"Code received ({len(code)} digits)")
 
             # ---------------- step 5: submit OTP ----------------
             await otp_field.click()

@@ -33,7 +33,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 import bina_core
+import security
 from bina_core import BinaSession, LoginError, mask
+from security import OwnershipError
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
@@ -45,18 +47,28 @@ ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").sp
 BINA_PHONE = os.getenv("BINA_PHONE", "").strip()
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "300"))
 
-# one live BinaSession per phone number, kept warm between actions
-_sessions: dict[str, BinaSession] = {}
+# one live BinaSession per (owner_id, phone), kept warm between actions
+_sessions: dict[tuple[int, str], BinaSession] = {}
 # per-chat OTP relay (mirrors the pattern from the login test)
 _otp_waiters: dict[int, asyncio.Future] = {}
 # per-chat single-job lock
 _locks: dict[int, asyncio.Lock] = {}
 
 
-def get_session(phone: str) -> BinaSession:
-    if phone not in _sessions:
-        _sessions[phone] = BinaSession(phone)
-    return _sessions[phone]
+def get_session(owner_id: int, phone: str) -> BinaSession:
+    key = (owner_id, security.phone_hash(phone))
+    if key not in _sessions:
+        _sessions[key] = BinaSession(phone, owner_id)
+    return _sessions[key]
+
+
+def check_ownership(phone: str, owner_id: int) -> bool:
+    """True if owner_id may use this number. Claims it if unclaimed."""
+    try:
+        security.claim(phone, owner_id)
+        return True
+    except OwnershipError:
+        return False
 
 
 def lock_for(chat_id: int) -> asyncio.Lock:
@@ -163,11 +175,19 @@ async def cb_status(call: CallbackQuery):
     if not phone:
         await call.message.answer("No number configured yet.", reply_markup=main_menu())
         return
-    sess = get_session(phone)
+    user_id = call.from_user.id
+    owner = security.owner_of(phone)
+    if owner is not None and str(owner) != str(user_id):
+        await call.message.answer("🔒 That number belongs to another user.",
+                                  reply_markup=main_menu())
+        return
+    sess = get_session(user_id, phone)
     saved = sess.session_file.exists()
+    enc = "on" if security.encryption_enabled() else "off"
     await call.message.answer(
         f"<b>{mask(phone)}</b>\n"
-        f"Saved session: {'🟢 yes' if saved else '⚪️ none (will need SMS)'}",
+        f"Saved session: {'🟢 yes' if saved else '⚪️ none (will need SMS)'}\n"
+        f"Encryption: {enc} · owned by you: {'yes' if owner else 'unclaimed'}",
         reply_markup=main_menu(),
     )
 
@@ -176,12 +196,16 @@ async def cb_status(call: CallbackQuery):
 async def cb_logout(call: CallbackQuery):
     await call.answer("Session forgotten")
     phone = phone_for(None)
-    if phone:
-        sess = get_session(phone)
+    user_id = call.from_user.id
+    if phone and (security.owner_of(phone) in (None, user_id) or
+                  str(security.owner_of(phone)) == str(user_id)):
+        sess = get_session(user_id, phone)
         sess.forget()
         await sess.close()
-    await call.message.answer("🚪 Saved session cleared. Next login needs an SMS code.",
-                              reply_markup=main_menu())
+    await call.message.answer(
+        "🚪 Saved session cleared. Next login needs an SMS code.\n"
+        "<i>(You still own this number — it stays reserved to you.)</i>",
+        reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "myads")
@@ -196,10 +220,9 @@ async def cb_myads(call: CallbackQuery, bot: Bot, state: FSMContext):
         await call.message.answer("⏳ Busy — one action at a time.")
         return
     async with lock_for(chat_id):
-        ok = await ensure_login(bot, chat_id, phone, state)
+        ok = await ensure_login(bot, chat_id, call.from_user.id, phone, state)
         if not ok:
             return
-        sess = get_session(phone)
         await call.message.answer("📋 You're logged in. (Ad-listing readout is the "
                                   "next feature to add — the session is ready for it.)",
                                   reply_markup=main_menu())
@@ -226,8 +249,19 @@ async def _otp_provider(bot: Bot, chat_id: int, state: FSMContext):
     return provider
 
 
-async def ensure_login(bot: Bot, chat_id: int, phone: str, state: FSMContext) -> bool:
-    sess = get_session(phone)
+async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str, state: FSMContext) -> bool:
+    # Ownership gate: a number belongs to the first user who connected it.
+    if not check_ownership(phone, user_id):
+        await bot.send_message(
+            chat_id,
+            "🔒 This number is already connected to a different user account. "
+            "For privacy and security, a bina.az number can only be used by the "
+            "Telegram account that first connected it.",
+            reply_markup=main_menu(),
+        )
+        return False
+
+    sess = get_session(user_id, phone)
     async with sess.lock:
         try:
             fresh = await sess.ensure_logged_in(await _otp_provider(bot, chat_id, state))
@@ -251,7 +285,7 @@ async def run_login(bot: Bot, chat_id: int, user_id: int, phone: str, state: FSM
         await bot.send_message(chat_id, "⏳ Busy — one action at a time.")
         return
     async with lock_for(chat_id):
-        ok = await ensure_login(bot, chat_id, phone, state)
+        ok = await ensure_login(bot, chat_id, user_id, phone, state)
         if ok:
             await bot.send_message(
                 chat_id,
