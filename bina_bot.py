@@ -27,7 +27,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -127,6 +127,29 @@ async def start(msg: Message, state: FSMContext):
         "login you usually won't need an SMS code again for a while.",
         reply_markup=main_menu(),
     )
+
+
+@dp.message(Command("debug"))
+async def cmd_debug(msg: Message):
+    """Send the newest debug snapshots (screenshot + HTML) to this chat."""
+    debug_dir = Path("debug")
+    if not debug_dir.exists():
+        await msg.answer("No debug/ folder yet — nothing has failed.")
+        return
+    files = sorted(debug_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        await msg.answer("debug/ is empty.")
+        return
+    # send the 4 most recent files (a couple of .png + .html pairs)
+    sent = 0
+    for f in files[:4]:
+        try:
+            await msg.answer_document(FSInputFile(str(f)), caption=f.name)
+            sent += 1
+        except Exception as exc:
+            await msg.answer(f"couldn't send {f.name}: {exc}")
+    await msg.answer(f"Sent {sent} newest debug file(s). "
+                     "The <code>*-open.html</code> ones show opened dropdowns.")
 
 
 @dp.message(Command("cancel"))
@@ -306,24 +329,15 @@ async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
-                                filter_text=None, tag="dropdown", optional=False):
-    """Open a bina.az dropdown, show its options as buttons, click the choice.
-
-    If discovery finds no options and optional=True, we leave the field on its
-    current value (city/district usually pre-fill) instead of failing.
-    """
+                                filter_text=None, tag="dropdown"):
+    """Open a bina.az dropdown, show its options as buttons, click the choice."""
     options = await flow.discover_options(opener_key, filter_text=filter_text, tag=tag)
     if not options:
-        if optional:
-            await bot.send_message(
-                chat_id,
-                f"ℹ️ Couldn't read the {tag} options — keeping the field's "
-                f"current value. (A snapshot was saved so this can be fixed.)")
-            return None
         raise PublishError(
             f"Opened the {tag} dropdown but found no options to show. "
-            f"A snapshot was saved to debug/ — send me the *-{tag}-open.html "
-            f"so I can pin the option selector.")
+            f"The option selector needs pinning — see the saved snapshot."
+        )
+    # Telegram callback_data is limited; map by index.
     labeled = [(opt[:40], str(i)) for i, opt in enumerate(options)]
     chosen_idx = await ask.ask_choice(bot, chat_id, prompt, labeled)
     chosen_text = options[int(chosen_idx)]
@@ -357,24 +371,13 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.choose_owner(is_owner)
 
         # step 4 — the form
-        # dependent dropdowns (discovered live). City/district often already
-        # hold a sensible default; if discovery returns nothing we keep it.
+        # dependent dropdowns (discovered live)
         await _choose_from_dropdown(bot, chat_id, flow, "type_dropdown",
                                     "Property type (Əmlakın növü)?", tag="type")
         await _choose_from_dropdown(bot, chat_id, flow, "city_button",
-                                    "City (Şəhər)?", tag="city", optional=True)
+                                    "City (Şəhər)?", tag="city")
         await _choose_from_dropdown(bot, chat_id, flow, "district_button",
-                                    "District (Rayon)?", tag="district", optional=True)
-        # Qəsəbə (settlement) appears after a district is chosen — optional.
-        try:
-            await _choose_from_dropdown(bot, chat_id, flow, "village_button",
-                                        "Settlement (Qəsəbə)?", tag="village",
-                                        optional=True)
-        except PublishError:
-            pass  # village field may not exist for every district
-
-        address = await ask.ask_text(bot, chat_id,
-                                     "Exact address (Ünvan / dəqiq yerləşmə)?")
+                                    "District (Rayon)?", tag="district")
 
         rooms = await ask.ask_text(bot, chat_id, "Number of rooms (Otaq sayı)?")
         area = await ask.ask_text(bot, chat_id, "Area in m² (Sahə)?")
@@ -389,7 +392,7 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                                   "Description (Əlavə məlumat). Don't include phone/email.")
         price = await ask.ask_text(bot, chat_id, "Price (Qiymət) in AZN?")
 
-        await flow.fill_details(address=address, rooms=rooms, area=area, floor=floor,
+        await flow.fill_details(rooms=rooms, area=area, floor=floor,
                                 total_floors=total, description=desc, price=price)
 
         # optional checkboxes
