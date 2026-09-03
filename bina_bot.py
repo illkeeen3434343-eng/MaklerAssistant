@@ -27,7 +27,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -97,15 +98,23 @@ class Whitelist(BaseMiddleware):
 
 
 # --------------------------------------------------------------------------
-def main_menu() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔑 Login / check session", callback_data="login")
-    kb.button(text="➕ New listing", callback_data="newlisting")
-    kb.button(text="📋 My ads", callback_data="myads")
-    kb.button(text="🩺 Session status", callback_data="status")
-    kb.button(text="🚪 Forget session", callback_data="logout")
-    kb.adjust(1)
-    return kb.as_markup()
+BTN_LOGIN = "🔑 Login"
+BTN_NEW = "➕ New listing"
+BTN_ADS = "📋 My ads"
+BTN_STATUS = "🩺 Status"
+BTN_LOGOUT = "🚪 Forget session"
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_NEW)],
+            [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_ADS)],
+            [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_LOGOUT)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Tap a button…",
+    )
 
 
 def phone_for(state_phone: str | None) -> str | None:
@@ -191,13 +200,11 @@ async def wizard_photo(msg: Message, bot: Bot):
         await msg.answer(f"couldn't save that photo: {exc}")
 
 
-@dp.message(F.text)
-async def wizard_text(msg: Message, state: FSMContext):
-    # Only consume if a wizard is awaiting a typed answer AND we're not mid-login.
-    if await state.get_state() is not None:
-        return
-    if ask.waiting_kind(msg.chat.id) in ("text", "choice"):
-        ask.feed_text(msg.chat.id, msg.text)
+MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_LOGOUT}
+
+
+# wizard_text is registered later (after the menu-button handlers) so those
+# exact-match handlers win for button taps. See _register_wizard_text below.
 
 
 # ---- OTP relay: any digits while we're waiting go to the login coroutine ---
@@ -219,6 +226,105 @@ async def got_phone(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(phone=msg.text.strip())
     await state.clear()
     await run_login(bot, msg.chat.id, msg.from_user.id, msg.text.strip(), state)
+
+
+# ---- reply-keyboard taps (buttons in the keyboard area send text) ----
+@dp.message(F.text == BTN_LOGIN)
+async def kb_login(msg: Message, state: FSMContext, bot: Bot):
+    phone = phone_for(None)
+    if not phone:
+        await state.set_state(Flow.ask_phone)
+        await msg.answer("📱 Send your bina.az number (e.g. <code>0557778899</code>):")
+        return
+    await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
+
+
+@dp.message(F.text == BTN_STATUS)
+async def kb_status(msg: Message):
+    phone = phone_for(None)
+    if not phone:
+        await msg.answer("No number configured yet.", reply_markup=main_menu())
+        return
+    owner = security.owner_of(phone)
+    if owner is not None and str(owner) != str(msg.from_user.id):
+        await msg.answer("🔒 That number belongs to another user.", reply_markup=main_menu())
+        return
+    sess = get_session(msg.from_user.id, phone)
+    saved = sess.session_file.exists()
+    enc = "on" if security.encryption_enabled() else "off"
+    await msg.answer(
+        f"<b>{mask(phone)}</b>\n"
+        f"Saved session: {'🟢 yes' if saved else '⚪️ none (will need SMS)'}\n"
+        f"Encryption: {enc} · owned by you: {'yes' if owner else 'unclaimed'}",
+        reply_markup=main_menu())
+
+
+@dp.message(F.text == BTN_LOGOUT)
+async def kb_logout(msg: Message):
+    phone = phone_for(None)
+    uid = msg.from_user.id
+    if phone and (security.owner_of(phone) in (None, uid) or
+                  str(security.owner_of(phone)) == str(uid)):
+        sess = get_session(uid, phone)
+        sess.forget()
+        await sess.close()
+    await msg.answer("🚪 Saved session cleared. Next login needs an SMS code.\n"
+                     "<i>(You still own this number — it stays reserved to you.)</i>",
+                     reply_markup=main_menu())
+
+
+@dp.message(F.text == BTN_ADS)
+async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
+    phone = phone_for(None)
+    if not phone:
+        await msg.answer("Configure a number first (🔑 Login).")
+        return
+    if lock_for(msg.chat.id).locked():
+        await msg.answer("⏳ Busy — one action at a time.")
+        return
+    async with lock_for(msg.chat.id):
+        ok = await ensure_login(bot, msg.chat.id, msg.from_user.id, phone, state)
+        if ok:
+            await msg.answer("📋 You're logged in.", reply_markup=main_menu())
+
+
+@dp.message(F.text == BTN_NEW)
+async def kb_new(msg: Message, bot: Bot, state: FSMContext):
+    phone = phone_for(None)
+    if not phone:
+        await msg.answer("Configure a number first (🔑 Login).")
+        return
+    if lock_for(msg.chat.id).locked():
+        await msg.answer("⏳ Busy — one action at a time.")
+        return
+    async with lock_for(msg.chat.id):
+        ok = await ensure_login(bot, msg.chat.id, msg.from_user.id, phone, state)
+        if not ok:
+            return
+        sess = get_session(msg.from_user.id, phone)
+        try:
+            await publish_wizard(bot, msg.chat.id, sess)
+        except Cancelled:
+            await bot.send_message(msg.chat.id, "🛑 Publishing cancelled.", reply_markup=main_menu())
+        except PublishError as exc:
+            await bot.send_message(msg.chat.id, f"❌ {exc}", reply_markup=main_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(msg.chat.id, "⏰ Timed out waiting for input.", reply_markup=main_menu())
+        except Exception as exc:
+            log.exception("publish wizard error")
+            await bot.send_message(msg.chat.id, f"💥 {exc}", reply_markup=main_menu())
+
+
+@dp.message(F.text)
+async def wizard_text(msg: Message, state: FSMContext):
+    """Catch-all for typed answers the wizard is awaiting. Registered AFTER the
+    menu-button handlers so exact-match button taps win."""
+    if msg.text in MENU_TEXTS:
+        return
+    if await state.get_state() is not None:
+        return
+    if ask.waiting_kind(msg.chat.id) in ("text", "choice"):
+        ask.feed_text(msg.chat.id, msg.text)
 
 
 # ---- buttons ----
@@ -329,17 +435,28 @@ async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
-                                filter_text=None, tag="dropdown"):
-    """Open a bina.az dropdown, show its options as buttons, click the choice."""
+                                filter_text=None, tag="dropdown", optional=False):
+    """Open a bina.az dropdown, show its options as buttons, click the choice.
+
+    Long lists (e.g. 69 cities) are capped to the first 90 with a note. If no
+    options are found and optional=True, we keep the field's current value.
+    """
     options = await flow.discover_options(opener_key, filter_text=filter_text, tag=tag)
     if not options:
+        if optional:
+            await bot.send_message(
+                chat_id, f"ℹ️ Couldn't read the {tag} options — keeping the "
+                         f"field's current value. (Snapshot saved.)")
+            return None
         raise PublishError(
-            f"Opened the {tag} dropdown but found no options to show. "
-            f"The option selector needs pinning — see the saved snapshot."
-        )
-    # Telegram callback_data is limited; map by index.
+            f"Opened the {tag} dropdown but found no options. A snapshot was "
+            f"saved to debug/ — send me the *-{tag}-open.html to pin it.")
+    note = ""
+    if len(options) > 90:
+        options = options[:90]
+        note = "\n<i>(showing first 90 — type in the field to filter if yours isn't here)</i>"
     labeled = [(opt[:40], str(i)) for i, opt in enumerate(options)]
-    chosen_idx = await ask.ask_choice(bot, chat_id, prompt, labeled)
+    chosen_idx = await ask.ask_choice(bot, chat_id, prompt + note, labeled)
     chosen_text = options[int(chosen_idx)]
     await flow.pick_option(chosen_text, tag=tag)
     return chosen_text
@@ -371,13 +488,25 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.choose_owner(is_owner)
 
         # step 4 — the form
-        # dependent dropdowns (discovered live)
         await _choose_from_dropdown(bot, chat_id, flow, "type_dropdown",
                                     "Property type (Əmlakın növü)?", tag="type")
-        await _choose_from_dropdown(bot, chat_id, flow, "city_button",
-                                    "City (Şəhər)?", tag="city")
-        await _choose_from_dropdown(bot, chat_id, flow, "district_button",
-                                    "District (Rayon)?", tag="district")
+        city = await _choose_from_dropdown(bot, chat_id, flow, "city_button",
+                                           "City (Şəhər)?", tag="city", optional=True)
+
+        # Rayon (district) exists ONLY for Bakı; other cities have no district.
+        city_is_baku = (city or "").strip().lower() in ("bakı", "baki", "baku")
+        if city_is_baku:
+            await _choose_from_dropdown(bot, chat_id, flow, "district_button",
+                                        "District (Rayon)?", tag="district", optional=True)
+            try:
+                await _choose_from_dropdown(bot, chat_id, flow, "village_button",
+                                            "Settlement (Qəsəbə)?", tag="village",
+                                            optional=True)
+            except PublishError:
+                pass
+
+        address = await ask.ask_text(bot, chat_id,
+                                     "Exact address (Ünvan / dəqiq yerləşmə)?")
 
         rooms = await ask.ask_text(bot, chat_id, "Number of rooms (Otaq sayı)?")
         area = await ask.ask_text(bot, chat_id, "Area in m² (Sahə)?")
@@ -392,7 +521,7 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                                   "Description (Əlavə məlumat). Don't include phone/email.")
         price = await ask.ask_text(bot, chat_id, "Price (Qiymət) in AZN?")
 
-        await flow.fill_details(rooms=rooms, area=area, floor=floor,
+        await flow.fill_details(address=address, rooms=rooms, area=area, floor=floor,
                                 total_floors=total, description=desc, price=price)
 
         # optional checkboxes
@@ -465,7 +594,8 @@ async def _otp_provider(bot: Bot, chat_id: int, state: FSMContext):
     return provider
 
 
-async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str, state: FSMContext) -> bool:
+async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str,
+                       state: FSMContext, announce_reused: bool = False) -> bool:
     # Ownership gate: a number belongs to the first user who connected it.
     if not check_ownership(phone, user_id):
         await bot.send_message(
@@ -491,8 +621,9 @@ async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str, state: 
             log.exception("login error")
             await bot.send_message(chat_id, f"💥 {exc}", reply_markup=main_menu())
             return False
-    if not fresh:
-        await bot.send_message(chat_id, "✅ Already logged in (used the saved session — no SMS needed).")
+    # Only mention a reused session when the user explicitly tapped Login.
+    if not fresh and announce_reused:
+        await bot.send_message(chat_id, "✅ Already logged in (saved session — no SMS needed).")
     return True
 
 
@@ -501,7 +632,7 @@ async def run_login(bot: Bot, chat_id: int, user_id: int, phone: str, state: FSM
         await bot.send_message(chat_id, "⏳ Busy — one action at a time.")
         return
     async with lock_for(chat_id):
-        ok = await ensure_login(bot, chat_id, user_id, phone, state)
+        ok = await ensure_login(bot, chat_id, user_id, phone, state, announce_reused=True)
         if ok:
             await bot.send_message(
                 chat_id,
