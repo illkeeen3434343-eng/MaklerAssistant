@@ -1,5 +1,8 @@
+.env
+sessions/
+debug/
 artifacts/
 __pycache__/
 *.pyc
 .venv/
-.env
+venv/

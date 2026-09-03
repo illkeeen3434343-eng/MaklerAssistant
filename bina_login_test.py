@@ -204,7 +204,13 @@ class Telegram:
                     continue
                 if text.lower() in {"/cancel", "/stop"}:
                     raise KeyboardInterrupt("cancelled by user")
-                # Try to delete so the OTP does not linger in chat history
+                # Acknowledge FIRST so the user sees the code registered, THEN
+                # delete it for privacy. Deleting without a confirmation made
+                # the code look like it vanished, so people retyped it.
+                try:
+                    await self.send("🔑 Code received, thanks.")
+                except Exception:
+                    pass
                 try:
                     await self.http.post(
                         f"{API}/deleteMessage",
