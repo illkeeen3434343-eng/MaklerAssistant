@@ -135,6 +135,10 @@ class BinaSession:
         )
         self._page = await self._ctx.new_page()
 
+    @property
+    def page(self):
+        return self._page
+
     async def close(self) -> None:
         try:
             if self._ctx:

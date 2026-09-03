@@ -37,6 +37,9 @@ import security
 from bina_core import BinaSession, LoginError, mask
 from security import OwnershipError
 
+from ask_broker import broker as ask, Cancelled
+from bina_publish import PublishFlow, PublishError
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -97,6 +100,7 @@ class Whitelist(BaseMiddleware):
 def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🔑 Login / check session", callback_data="login")
+    kb.button(text="➕ New listing", callback_data="newlisting")
     kb.button(text="📋 My ads", callback_data="myads")
     kb.button(text="🩺 Session status", callback_data="status")
     kb.button(text="🚪 Forget session", callback_data="logout")
@@ -130,8 +134,47 @@ async def cancel(msg: Message, state: FSMContext):
     fut = _otp_waiters.get(msg.chat.id)
     if fut and not fut.done():
         fut.cancel()
+    ask.cancel(msg.chat.id)
     await state.clear()
     await msg.answer("Cancelled.", reply_markup=main_menu())
+
+
+# ---- wizard input routing (only fires while a wizard awaits input) --------
+@dp.callback_query(F.data.startswith("wz:"))
+async def wizard_button(call: CallbackQuery):
+    value = call.data[3:]
+    await call.answer()
+    if value == "__cancel__":
+        ask.cancel(call.message.chat.id)
+    elif value == "__photos_done__":
+        ask.feed_photos_done(call.message.chat.id)
+    else:
+        ask.feed_choice(call.message.chat.id, value)
+
+
+@dp.message(F.photo)
+async def wizard_photo(msg: Message, bot: Bot):
+    if ask.waiting_kind(msg.chat.id) != "photos":
+        return
+    # download the largest size to a temp file, hand the path to the broker
+    import tempfile
+    photo = msg.photo[-1]
+    path = str(Path(tempfile.gettempdir()) / f"binaphoto_{photo.file_unique_id}.jpg")
+    try:
+        await bot.download(photo, destination=path)
+        ask.feed_photo(msg.chat.id, path)
+        await msg.answer("📷 got it — send more, or tap ✅ Done")
+    except Exception as exc:
+        await msg.answer(f"couldn't save that photo: {exc}")
+
+
+@dp.message(F.text)
+async def wizard_text(msg: Message, state: FSMContext):
+    # Only consume if a wizard is awaiting a typed answer AND we're not mid-login.
+    if await state.get_state() is not None:
+        return
+    if ask.waiting_kind(msg.chat.id) in ("text", "choice"):
+        ask.feed_text(msg.chat.id, msg.text)
 
 
 # ---- OTP relay: any digits while we're waiting go to the login coroutine ---
@@ -226,6 +269,156 @@ async def cb_myads(call: CallbackQuery, bot: Bot, state: FSMContext):
         await call.message.answer("📋 You're logged in. (Ad-listing readout is the "
                                   "next feature to add — the session is ready for it.)",
                                   reply_markup=main_menu())
+
+
+PUBLISHER_NAME = os.getenv("PUBLISHER_NAME", "").strip()
+PUBLISHER_EMAIL = os.getenv("PUBLISHER_EMAIL", "").strip()
+
+
+@dp.callback_query(F.data == "newlisting")
+async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
+    await call.answer()
+    phone = phone_for(None)
+    if not phone:
+        await call.message.answer("Configure a number first (🔑 Login).")
+        return
+    chat_id = call.message.chat.id
+    if lock_for(chat_id).locked():
+        await call.message.answer("⏳ Busy — one action at a time.")
+        return
+    async with lock_for(chat_id):
+        ok = await ensure_login(bot, chat_id, call.from_user.id, phone, state)
+        if not ok:
+            return
+        sess = get_session(call.from_user.id, phone)
+        try:
+            await publish_wizard(bot, chat_id, sess)
+        except Cancelled:
+            await bot.send_message(chat_id, "🛑 Publishing cancelled.", reply_markup=main_menu())
+        except PublishError as exc:
+            await bot.send_message(chat_id, f"❌ {exc}\nA debug snapshot was saved.",
+                                   reply_markup=main_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Timed out waiting for input.", reply_markup=main_menu())
+        except Exception as exc:
+            log.exception("publish wizard error")
+            await bot.send_message(chat_id, f"💥 {exc}", reply_markup=main_menu())
+
+
+async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
+                                filter_text=None, tag="dropdown"):
+    """Open a bina.az dropdown, show its options as buttons, click the choice."""
+    options = await flow.discover_options(opener_key, filter_text=filter_text, tag=tag)
+    if not options:
+        raise PublishError(
+            f"Opened the {tag} dropdown but found no options to show. "
+            f"The option selector needs pinning — see the saved snapshot."
+        )
+    # Telegram callback_data is limited; map by index.
+    labeled = [(opt[:40], str(i)) for i, opt in enumerate(options)]
+    chosen_idx = await ask.ask_choice(bot, chat_id, prompt, labeled)
+    chosen_text = options[int(chosen_idx)]
+    await flow.pick_option(chosen_text, tag=tag)
+    return chosen_text
+
+
+async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
+    flow = PublishFlow(sess)
+    await bot.send_message(chat_id, "🏗 <b>New listing</b> — let's go. I'll ask one thing at a time.")
+
+    async with sess.lock:
+        await flow.open_new_ad()
+
+        # step 1 — deal type
+        deal = await ask.ask_choice(bot, chat_id, "Deal type?",
+                                    [("Sell (Satıram)", "sell"), ("Rent (Kirayə)", "rent")])
+        await flow.choose_deal(sell=(deal == "sell"))
+
+        # step 2 — category (apartment types only, for now)
+        cat = await ask.ask_choice(bot, chat_id, "Category?",
+                                   [("Yeni tikili", "Yeni tikili"),
+                                    ("Köhnə tikili", "Köhnə tikili")])
+        await flow.choose_category(cat)
+
+        # step 3 — owner vs agent
+        who = await ask.ask_choice(bot, chat_id, "You are the…",
+                                   [("Owner (Elanın sahibi)", "owner"),
+                                    ("Agent (Vasitəçi)", "agent")])
+        is_owner = who == "owner"
+        await flow.choose_owner(is_owner)
+
+        # step 4 — the form
+        # dependent dropdowns (discovered live)
+        await _choose_from_dropdown(bot, chat_id, flow, "type_dropdown",
+                                    "Property type (Əmlakın növü)?", tag="type")
+        await _choose_from_dropdown(bot, chat_id, flow, "city_button",
+                                    "City (Şəhər)?", tag="city")
+        await _choose_from_dropdown(bot, chat_id, flow, "district_button",
+                                    "District (Rayon)?", tag="district")
+
+        rooms = await ask.ask_text(bot, chat_id, "Number of rooms (Otaq sayı)?")
+        area = await ask.ask_text(bot, chat_id, "Area in m² (Sahə)?")
+        floor = await ask.ask_text(bot, chat_id, "Floor (Mərtəbə)?")
+        total = await ask.ask_text(bot, chat_id, "Total floors (Mərtəbələrin sayı)?")
+
+        repair = await ask.ask_choice(bot, chat_id, "Repair (Təmir)?",
+                                      [("Təmirli (yes)", "yes"), ("Təmirsiz (no)", "no")])
+        await flow.set_repair(repair == "yes")
+
+        desc = await ask.ask_text(bot, chat_id,
+                                  "Description (Əlavə məlumat). Don't include phone/email.")
+        price = await ask.ask_text(bot, chat_id, "Price (Qiymət) in AZN?")
+
+        await flow.fill_details(rooms=rooms, area=area, floor=floor,
+                                total_floors=total, description=desc, price=price)
+
+        # optional checkboxes
+        extras = await ask.ask_choice(bot, chat_id, "Any of these apply?",
+                                      [("Çıxarış var (bill of sale)", "bill"),
+                                       ("İpoteka var (mortgage)", "mortgage"),
+                                       ("Neither", "none")])
+        if extras == "bill":
+            await flow.set_checkbox("bill_of_sale", True)
+        elif extras == "mortgage":
+            await flow.set_checkbox("mortgage", True)
+
+        # photos (min 4)
+        photos = await ask.ask_photos(
+            bot, chat_id,
+            "📷 Send at least <b>4 photos</b> (max 30). Tap ✅ Done when finished.\n"
+            "<i>No screenshots, logos, framed or blurry photos — bina.az rejects those.</i>")
+        if len(photos) < 4:
+            raise PublishError(f"Only {len(photos)} photo(s) — bina.az needs at least 4.")
+        await flow.add_photos(photos)
+
+        # contact
+        name = PUBLISHER_NAME or await ask.ask_text(bot, chat_id, "Your name (Ad)?")
+        email = PUBLISHER_EMAIL or await ask.ask_text(bot, chat_id, "Your e-mail?")
+        await flow.fill_contact(name=name, email=email, is_owner=is_owner)
+
+        # review + submit
+        summary = (f"<b>Review</b>\n"
+                   f"• {cat}, {'Sell' if deal=='sell' else 'Rent'}\n"
+                   f"• {rooms} rooms · {area} m² · floor {floor}/{total}\n"
+                   f"• Repair: {repair} · Price: {price} AZN\n"
+                   f"• {len(photos)} photos\n\n"
+                   f"Tap Continue to submit the form (bina.az may then show a "
+                   f"package/preview step).")
+        go = await ask.ask_choice(bot, chat_id, summary,
+                                  [("▶️ Continue (Davam etmək)", "go")])
+        if go != "go":
+            raise Cancelled()
+
+        final_url = await flow.submit()
+
+    await bot.send_message(
+        chat_id,
+        "✅ Form submitted (clicked <b>Davam etmək</b>).\n"
+        f"Now on: <code>{final_url}</code>\n\n"
+        "⚠️ If bina.az shows a package/preview/publish step after this, that "
+        "part isn't automated yet — finish it in the browser, or send me that "
+        "page's HTML and I'll add it.",
+        reply_markup=main_menu())
 
 
 # --------------------------------------------------------------------------

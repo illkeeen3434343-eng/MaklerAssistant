@@ -166,3 +166,24 @@ yet **read your ads** or **change prices**; "My ads" currently just confirms
 login. The session is ready for those; they're the next features to build on top
 of `bina_core.BinaSession` (add `fetch_listings()` and `update_price()` methods,
 then wire buttons to them).
+
+---
+
+## New listing (publish) — status
+
+`➕ New listing` runs a step-by-step wizard: deal type → category → owner/agent
+→ property type / city / district (options discovered live and shown as
+buttons) → rooms, area, floor, floors → repair → photos (min 4) → description →
+price → contact → **Davam etmək**.
+
+Two things still need one capture each to be fully reliable:
+
+1. **Opened dropdown option selector.** The wizard scrapes options live and
+   shows them as buttons; if a dropdown comes back empty, it saves a snapshot to
+   `debug/` — send that HTML to pin the selector.
+2. **What comes after "Davam etmək."** That button is *Continue*, not
+   necessarily the final publish — bina.az likely shows a package/preview step
+   next, which isn't automated yet. Capture that page to finish the flow.
+
+Optional `PUBLISHER_NAME` / `PUBLISHER_EMAIL` in `.env` skip the name/email
+questions.
