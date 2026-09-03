@@ -37,7 +37,9 @@ PUB = {
     "type_dropdown": "[data-cy='category-dropdown']",                    # confirmed (opener)
     "city_button": "[data-cy='item-form-city']",                        # confirmed (opener)
     "district_button": "[data-cy='item-form-location']",               # confirmed (opener)
-    "search_input": "[data-cy='search-input'], input[type='search']",    # confirmed (inside city)
+    "village_button": "[data-cy='item-form-village']",                 # confirmed (opener, appears after district)
+    "address": "input[name='address']",                                # confirmed (Ünvan)
+    "search_input": "[data-cy='search-input'], input[type='search']",    # confirmed (inside dropdowns)
     "rooms": "input[name='roomsAmount']",                               # confirmed
     "area": "input[name='area']",                                      # confirmed
     "floor": "input[name='floor']",                                    # confirmed
@@ -100,6 +102,19 @@ class PublishFlow:
             await self.s.snapshot(f"publish-{what}")
             raise PublishError(f"Could not fill {what} ({selector}).") from exc
 
+    async def _fill_textarea(self, value: str):
+        """Description is a textarea wrapped in a role=button container; click
+        the wrapper first, then type into the textarea by data-cy."""
+        try:
+            wrap = self.page.locator("[data-cy='text-area-container']").first
+            await wrap.click()
+            ta = self.page.locator("[data-cy='text-area-input'], textarea[name='description']").first
+            await ta.fill("")
+            await ta.type(str(value), delay=15)
+        except Exception as exc:
+            await self.s.snapshot("publish-description")
+            raise PublishError(f"Could not fill description: {exc}") from exc
+
     async def _click_text(self, text: str, what: str):
         """Click an element by its exact visible text (for options/categories)."""
         try:
@@ -136,10 +151,17 @@ class PublishFlow:
                                tag: str = "dropdown") -> list[str]:
         """Open a dropdown and return the visible option texts.
 
-        Also dumps the opened HTML so the exact option selector can be pinned.
+        The form has permanent <ul><li> TAB lists (Satıram/Kirayə,
+        Elanın sahibi/Mən vasitəçiyəm) that must NOT be treated as options.
+        We snapshot the visible option-texts BEFORE opening, then again AFTER,
+        and return only the newly-appeared ones — so tabs and other static
+        chrome are excluded automatically.
         """
+        # texts visible before opening (tabs, labels, etc.)
+        before = set(await self._scan_option_texts())
+
         await self._click(PUB[opener_key], f"open-{tag}")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.2)
 
         if filter_text:
             try:
@@ -152,31 +174,49 @@ class PublishFlow:
 
         await self.s.snapshot(f"publish-{tag}-open")
 
-        texts = await self.page.evaluate(
+        after = await self._scan_option_texts()
+        # keep order, drop anything that was already on screen (the tabs)
+        new = [t for t in after if t not in before]
+        return new or after   # fall back to all if the diff came up empty
+
+    # Known tab/label texts that are never real dropdown options.
+    _NON_OPTIONS = {
+        "Satıram", "Kirayə verirəm", "Elanın sahibi", "Mən vasitəçiyəm",
+        "Təmirli", "Təmirsiz", "Çıxarış var", "İpoteka var",
+        "Xəritədə göstər", "Şəkil əlavə etmək",
+    }
+
+    async def _scan_option_texts(self) -> list[str]:
+        return await self.page.evaluate(
             """(candidates) => {
+                const skip = %s;
                 const seen = new Set(); const out = [];
                 for (const sel of candidates) {
-                    let els;
-                    try { els = document.querySelectorAll(sel); } catch { continue; }
+                    let els; try { els = document.querySelectorAll(sel); } catch { continue; }
                     for (const el of els) {
                         if (!el.getClientRects().length) continue;      // visible only
+                        // skip the permanent tab bars
+                        if (el.closest("[role='tab']") || el.getAttribute('role') === 'tab') continue;
                         const t = (el.innerText || '').trim();
                         if (!t || t.length > 60 || seen.has(t)) continue;
+                        if (skip.includes(t)) continue;
                         seen.add(t); out.push(t);
                     }
                 }
-                return out.slice(0, 60);
-            }""",
+                return out.slice(0, 80);
+            }""".replace("%s", "[" + ",".join(f'"{x}"' for x in self._NON_OPTIONS) + "]"),
             OPTION_CANDIDATES,
         )
-        return texts
 
     async def pick_option(self, text: str, tag: str = "option"):
         await self._click_text(text, tag)
         await asyncio.sleep(1.0)
 
     async def fill_details(self, *, rooms=None, area=None, floor=None,
-                           total_floors=None, description=None, price=None):
+                           total_floors=None, description=None, price=None,
+                           address=None):
+        if address is not None:
+            await self._fill(PUB["address"], address, "address")
         if rooms is not None:
             await self._fill(PUB["rooms"], rooms, "rooms")
         if area is not None:
@@ -186,7 +226,7 @@ class PublishFlow:
         if total_floors is not None:
             await self._fill(PUB["total_floors"], total_floors, "total-floors")
         if description is not None:
-            await self._fill(PUB["description"], description, "description")
+            await self._fill_textarea(description)
         if price is not None:
             await self._fill(PUB["price"], price, "price")
 
