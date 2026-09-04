@@ -66,7 +66,12 @@ OPTION_CANDIDATES = [
     "[data-cy*='option']",
     "[data-cy*='dropdown'] li",
     "[role='listbox'] li",
+    "[role='listbox'] [role='button']",
+    "[class*='option']",
+    "[class*='dropdown'] li",
+    "[class*='menu'] li",
     "ul li",
+    "li",
 ]
 
 

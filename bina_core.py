@@ -33,7 +33,7 @@ MY_ITEMS_URL = os.getenv("MY_ITEMS_URL", "https://bina.az/items/my").strip()
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "sessions"))
-DEBUG_DIR = Path("debug")
+DEBUG_DIR = Path(__file__).resolve().parent / "debug"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 
 import bina_core
 import security
+import users as U
 from bina_core import BinaSession, LoginError, mask
 from security import OwnershipError
 
@@ -48,6 +49,7 @@ log = logging.getLogger("makler")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 BINA_PHONE = os.getenv("BINA_PHONE", "").strip()
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "300"))
 
@@ -103,17 +105,39 @@ BTN_NEW = "➕ New listing"
 BTN_ADS = "📋 My ads"
 BTN_STATUS = "🩺 Status"
 BTN_LOGOUT = "🚪 Forget session"
+BTN_NEWSESSION = "🔄 New session"
+BTN_ADMIN = "🛠 Admin"
+
+# admin sub-menu
+BTN_A_PENDING = "⏳ Pending users"
+BTN_A_USERS = "👥 All users"
+BTN_A_SETSTATUS = "✅ Set status"
+BTN_A_SETTIER = "⭐ Set tier"
+BTN_A_BACK = "⬅️ Back"
 
 
-def main_menu() -> ReplyKeyboardMarkup:
+def main_menu(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=BTN_NEW)],
+        [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_NEWSESSION)],
+        [KeyboardButton(text=BTN_ADS), KeyboardButton(text=BTN_STATUS)],
+        [KeyboardButton(text=BTN_LOGOUT)],
+    ]
+    if user_id is not None and user_id in ADMIN_IDS:
+        rows.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
+                               input_field_placeholder="Tap a button…")
+
+
+def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_NEW)],
-            [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_ADS)],
-            [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_LOGOUT)],
+            [KeyboardButton(text=BTN_A_PENDING), KeyboardButton(text=BTN_A_USERS)],
+            [KeyboardButton(text=BTN_A_SETSTATUS), KeyboardButton(text=BTN_A_SETTIER)],
+            [KeyboardButton(text=BTN_A_BACK)],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Tap a button…",
+        input_field_placeholder="Admin…",
     )
 
 
@@ -128,37 +152,51 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(CommandStart())
 async def start(msg: Message, state: FSMContext):
     await state.clear()
+    uid = msg.from_user.id
+    # Register the user (pending by default). Admins are auto-active.
+    U.ensure_user(uid, default_status="active" if uid in ADMIN_IDS else "pending")
+    if uid in ADMIN_IDS and not U.is_active(uid):
+        U.set_status(uid, "active")
     who = mask(BINA_PHONE) if BINA_PHONE else "not set"
+    rec = U.get_user(uid) or {}
+    extra = ""
+    if uid in ADMIN_IDS:
+        extra = "\n\n🛠 You are an <b>admin</b> — use the Admin button."
+    elif rec.get("status") != "active":
+        extra = ("\n\n⏳ Your account is <b>pending</b> approval. An admin must "
+                 "activate you before you can use the bot.")
     await msg.answer(
         "👋 <b>MaklerAssistant</b>\n\n"
-        f"Configured number: <b>{who}</b>\n\n"
-        "Tap a button to begin. Your session is cached, so after the first "
-        "login you usually won't need an SMS code again for a while.",
-        reply_markup=main_menu(),
+        f"Configured number: <b>{who}</b>\n"
+        f"Status: <b>{rec.get('status','?')}</b> · Tier: <b>{rec.get('tier','free')}</b>"
+        + extra,
+        reply_markup=main_menu(uid),
     )
 
 
 @dp.message(Command("debug"))
 async def cmd_debug(msg: Message):
     """Send the newest debug snapshots (screenshot + HTML) to this chat."""
-    debug_dir = Path("debug")
+    # Anchor to the script's folder so it works regardless of cwd.
+    debug_dir = Path(__file__).resolve().parent / "debug"
     if not debug_dir.exists():
-        await msg.answer("No debug/ folder yet — nothing has failed.")
+        await msg.answer(f"No debug/ folder yet at <code>{debug_dir}</code> — "
+                         "nothing has failed, or snapshots go elsewhere.")
         return
     files = sorted(debug_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
-        await msg.answer("debug/ is empty.")
+        await msg.answer(f"<code>{debug_dir}</code> is empty.")
         return
-    # send the 4 most recent files (a couple of .png + .html pairs)
+    await msg.answer(f"Found {len(files)} file(s) in debug/. Sending newest…")
     sent = 0
-    for f in files[:4]:
+    for f in files[:6]:
         try:
             await msg.answer_document(FSInputFile(str(f)), caption=f.name)
             sent += 1
         except Exception as exc:
             await msg.answer(f"couldn't send {f.name}: {exc}")
-    await msg.answer(f"Sent {sent} newest debug file(s). "
-                     "The <code>*-open.html</code> ones show opened dropdowns.")
+    await msg.answer(f"Sent {sent} file(s). The <code>*-open.html</code> ones "
+                     "show opened dropdowns — forward those to Claude.")
 
 
 @dp.message(Command("cancel"))
@@ -200,7 +238,9 @@ async def wizard_photo(msg: Message, bot: Bot):
         await msg.answer(f"couldn't save that photo: {exc}")
 
 
-MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_LOGOUT}
+MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_LOGOUT,
+              BTN_NEWSESSION, BTN_ADMIN,
+              BTN_A_PENDING, BTN_A_USERS, BTN_A_SETSTATUS, BTN_A_SETTIER, BTN_A_BACK}
 
 
 # wizard_text is registered later (after the menu-button handlers) so those
@@ -223,9 +263,14 @@ async def got_otp(msg: Message):
 
 @dp.message(Flow.ask_phone)
 async def got_phone(msg: Message, state: FSMContext, bot: Bot):
-    await state.update_data(phone=msg.text.strip())
+    phone = msg.text.strip()
     await state.clear()
-    await run_login(bot, msg.chat.id, msg.from_user.id, msg.text.strip(), state)
+    # record the number under this user (respects tier cap)
+    ok, note = U.add_number(msg.from_user.id, phone)
+    if not ok:
+        await msg.answer(f"⚠️ {note}", reply_markup=main_menu(msg.from_user.id))
+        return
+    await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
 
 
 # ---- reply-keyboard taps (buttons in the keyboard area send text) ----
@@ -237,6 +282,147 @@ async def kb_login(msg: Message, state: FSMContext, bot: Bot):
         await msg.answer("📱 Send your bina.az number (e.g. <code>0557778899</code>):")
         return
     await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
+
+
+@dp.message(F.text == BTN_NEWSESSION)
+async def kb_newsession(msg: Message, state: FSMContext):
+    """Log in with ANOTHER number (subject to the user's tier cap)."""
+    uid = msg.from_user.id
+    cap = U.max_numbers(uid)
+    have = len(U.numbers(uid))
+    if have >= cap:
+        await msg.answer(
+            f"Your tier ({U.tier_of(uid)}) allows {cap} number(s) and you have "
+            f"{have}. Ask an admin to upgrade your tier to add more.",
+            reply_markup=main_menu(uid))
+        return
+    await state.set_state(Flow.ask_phone)
+    await msg.answer("🔄 Send the <b>other</b> bina.az number to connect "
+                     "(e.g. <code>0701112233</code>):")
+
+
+# ==================== ADMIN PANEL (#5, #6, #7) ====================
+def _is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+
+@dp.message(F.text == BTN_ADMIN)
+async def kb_admin(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        await msg.answer("⛔️ Admins only.")
+        return
+    # #7: main buttons -> tap Admin -> admin buttons + Back appear
+    await msg.answer("🛠 <b>Admin panel</b>\nManage users, statuses and tiers.",
+                     reply_markup=admin_menu())
+
+
+@dp.message(F.text == BTN_A_BACK)
+async def kb_admin_back(msg: Message):
+    # #7: Back -> main buttons return
+    await msg.answer("Back to the main menu.", reply_markup=main_menu(msg.from_user.id))
+
+
+@dp.message(F.text == BTN_A_PENDING)
+async def kb_admin_pending(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    data = U.all_users()
+    pend = {u: r for u, r in data.items() if r.get("status") == "pending"}
+    if not pend:
+        await msg.answer("No pending users.", reply_markup=admin_menu())
+        return
+    lines = ["<b>Pending users</b>", ""]
+    for u, r in pend.items():
+        lines.append(f"• <code>{u}</code> — tier {r.get('tier')}, "
+                     f"{len(r.get('numbers', []))} number(s)")
+    lines.append("\nUse <b>Set status</b> to activate them.")
+    await msg.answer("\n".join(lines), reply_markup=admin_menu())
+
+
+@dp.message(F.text == BTN_A_USERS)
+async def kb_admin_users(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    data = U.all_users()
+    if not data:
+        await msg.answer("No users yet.", reply_markup=admin_menu())
+        return
+    lines = ["<b>All users</b>", ""]
+    for u, r in data.items():
+        star = " 🛠" if int(u) in ADMIN_IDS else ""
+        lines.append(f"• <code>{u}</code>{star} — {r.get('status')} / "
+                     f"{r.get('tier')} / {len(r.get('numbers', []))} num")
+    await msg.answer("\n".join(lines)[:3800], reply_markup=admin_menu())
+
+
+@dp.message(F.text == BTN_A_SETSTATUS)
+async def kb_admin_setstatus(msg: Message, bot: Bot):
+    if not _is_admin(msg.from_user.id):
+        return
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Busy — finish the current action first.")
+        return
+    async with lock_for(chat_id):
+        try:
+            target = await ask.ask_text(bot, chat_id,
+                "Send the <b>Telegram user id</b> to change status for:")
+            target = target.strip()
+            if not target.isdigit():
+                await bot.send_message(chat_id, "That's not a numeric id.", reply_markup=admin_menu())
+                return
+            status = await ask.ask_choice(bot, chat_id,
+                f"New status for <code>{target}</code>?",
+                [("✅ active", "active"), ("⏳ pending", "pending"), ("🚫 blocked", "blocked")])
+            U.ensure_user(int(target))
+            U.set_status(int(target), status)
+            await bot.send_message(chat_id, f"✅ User <code>{target}</code> → {status}.",
+                                   reply_markup=admin_menu())
+            # notify the user
+            try:
+                await bot.send_message(int(target),
+                    f"ℹ️ An admin set your status to <b>{status}</b>.")
+            except Exception:
+                pass
+        except Cancelled:
+            await bot.send_message(chat_id, "Cancelled.", reply_markup=admin_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Timed out.", reply_markup=admin_menu())
+
+
+@dp.message(F.text == BTN_A_SETTIER)
+async def kb_admin_settier(msg: Message, bot: Bot):
+    if not _is_admin(msg.from_user.id):
+        return
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Busy — finish the current action first.")
+        return
+    async with lock_for(chat_id):
+        try:
+            target = await ask.ask_text(bot, chat_id,
+                "Send the <b>Telegram user id</b> to change tier for:")
+            target = target.strip()
+            if not target.isdigit():
+                await bot.send_message(chat_id, "That's not a numeric id.", reply_markup=admin_menu())
+                return
+            tier = await ask.ask_choice(bot, chat_id,
+                f"New tier for <code>{target}</code>?",
+                [("Free (1 num)", "free"), ("Pro (2 num)", "pro"), ("Diamond (5 num)", "diamond")])
+            U.ensure_user(int(target))
+            U.set_tier(int(target), tier)
+            await bot.send_message(chat_id, f"⭐ User <code>{target}</code> → {tier}.",
+                                   reply_markup=admin_menu())
+            try:
+                await bot.send_message(int(target),
+                    f"⭐ An admin upgraded your tier to <b>{tier}</b>.")
+            except Exception:
+                pass
+        except Cancelled:
+            await bot.send_message(chat_id, "Cancelled.", reply_markup=admin_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Timed out.", reply_markup=admin_menu())
+# ==================== END ADMIN PANEL ====================
 
 
 @dp.message(F.text == BTN_STATUS)
