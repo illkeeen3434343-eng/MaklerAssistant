@@ -99,13 +99,36 @@ class PublishFlow:
     async def _fill(self, selector: str, value: str, what: str):
         try:
             loc = self.page.locator(selector).first
+            await loc.scroll_into_view_if_needed(timeout=8000)
             await loc.wait_for(state="visible", timeout=8000)
             await loc.click()
-            await loc.fill("")
-            await loc.type(str(value), delay=40)
-        except PWTimeout as exc:
-            await self.s.snapshot(f"publish-{what}")
-            raise PublishError(f"Could not fill {what} ({selector}).") from exc
+            await loc.fill(str(value))
+            return
+        except Exception:
+            pass
+        # Fallback: set the value via JS and dispatch input/change events so
+        # React registers it (some fields are picky about how they're filled).
+        try:
+            ok = await self.page.evaluate(
+                """({sel, val}) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    el.scrollIntoView({block:'center'});
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, val);
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                    return true;
+                }""",
+                {"sel": selector, "val": str(value)},
+            )
+            if ok:
+                return
+        except Exception:
+            pass
+        await self.s.snapshot(f"publish-{what}")
+        raise PublishError(f"Could not fill {what} ({selector}).")
 
     async def _fill_textarea(self, value: str):
         """Description is a textarea wrapped in a role=button container; click

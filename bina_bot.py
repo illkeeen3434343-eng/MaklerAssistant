@@ -16,8 +16,10 @@ Requires (in .env or the environment):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
@@ -127,7 +129,6 @@ BTN_A_SETTIER = "⭐ Set tier"
 BTN_A_BACK = "⬅️ Back"
 
 
-import contextvars
 _current_uid: contextvars.ContextVar = contextvars.ContextVar("uid", default=None)
 
 
@@ -752,6 +753,35 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
     return chosen_text
 
 
+async def _choose_city_paged(bot, chat_id, flow):
+    """Show cities 5 at a time with a 'Digər' (More) button until one is picked.
+
+    Reselecting the city is what makes the Rayon dropdown appear for Bakı, so
+    we always go through the real dropdown rather than keeping the default.
+    """
+    cities = await flow.discover_options("city_button", tag="city")
+    if not cities:
+        cities = ["Bakı"]  # fallback; at least let Bakı through
+    page = 0
+    while True:
+        chunk = cities[page * 5:(page + 1) * 5]
+        opts = [(c[:40], f"c{page * 5 + i}") for i, c in enumerate(chunk)]
+        more = (page + 1) * 5 < len(cities)
+        if more:
+            opts.append(("➡️ Digər (more)", "more"))
+        chosen = await ask.ask_choice(bot, chat_id, "City (Şəhər)?", opts)
+        if chosen == "more":
+            page += 1
+            continue
+        idx = int(chosen[1:])
+        city = cities[idx]
+        try:
+            await flow.pick_option(city, tag="city")
+        except PublishError:
+            await bot.send_message(chat_id, f"⚠️ Couldn't select {city}; using default.")
+        return city
+
+
 async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
     flow = PublishFlow(sess)
     await bot.send_message(chat_id, "🏗 <b>New listing</b> — let's go. I'll ask one thing at a time.")
@@ -759,39 +789,27 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
     async with sess.lock:
         await flow.open_new_ad()
 
-        # step 1 — deal type
-        deal = await ask.ask_choice(bot, chat_id, "Deal type?",
-                                    [("Sell (Satıram)", "sell"), ("Rent (Kirayə)", "rent")])
-        await flow.choose_deal(sell=(deal == "sell"))
+        # Deal type is always SELL (this bot is for selling) — set silently.
+        await flow.choose_deal(sell=True)
 
-        # step 2 — category (apartment types only, for now)
-        cat = await ask.ask_choice(bot, chat_id, "Category?",
+        # Category = property type. Asked ONCE here; sets the type dropdown.
+        cat = await ask.ask_choice(bot, chat_id, "Property type?",
                                    [("Yeni tikili", "Yeni tikili"),
                                     ("Köhnə tikili", "Köhnə tikili")])
         await flow.choose_category(cat)
 
-        # step 3 — owner vs agent
+        # Owner vs agent
         who = await ask.ask_choice(bot, chat_id, "You are the…",
                                    [("Owner (Elanın sahibi)", "owner"),
                                     ("Agent (Vasitəçi)", "agent")])
         is_owner = who == "owner"
         await flow.choose_owner(is_owner)
 
-        # step 4 — the form
-        # Property type defaults to a valid value on the page; if we can't read
-        # the dropdown options, keep the default rather than fail the whole run.
-        await _choose_from_dropdown(bot, chat_id, flow, "type_dropdown",
-                                    "Property type (Əmlakın növü)?", tag="type",
-                                    optional=True,
-                                    known=["Yeni tikili", "Köhnə tikili",
-                                           "Həyət evi/Bağ evi", "Ofis", "Qaraj",
-                                           "Torpaq", "Obyekt"])
-        city = await _choose_from_dropdown(bot, chat_id, flow, "city_button",
-                                           "City (Şəhər)?", tag="city", optional=True)
+        # City — paginated 5-at-a-time with "Digər". Reselecting reveals Rayon.
+        city = await _choose_city_paged(bot, chat_id, flow)
 
-        # Rayon (district) exists ONLY for Bakı; other cities have no district.
-        city_is_baku = (city or "").strip().lower() in ("bakı", "baki", "baku")
-        if city_is_baku:
+        # Rayon (district) exists ONLY for Bakı.
+        if (city or "").strip().lower() in ("bakı", "baki", "baku"):
             await _choose_from_dropdown(bot, chat_id, flow, "district_button",
                                         "District (Rayon)?", tag="district", optional=True)
             try:
@@ -830,13 +848,22 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         elif extras == "mortgage":
             await flow.set_checkbox("mortgage", True)
 
-        # photos (min 4)
-        photos = await ask.ask_photos(
-            bot, chat_id,
-            "📷 Send at least <b>4 photos</b> (max 30). Tap ✅ Done when finished.\n"
-            "<i>No screenshots, logos, framed or blurry photos — bina.az rejects those.</i>")
-        if len(photos) < 4:
-            raise PublishError(f"Only {len(photos)} photo(s) — bina.az needs at least 4.")
+        # photos (min 4, max 30)
+        while True:
+            photos = await ask.ask_photos(
+                bot, chat_id,
+                "📷 Send your photos (at least <b>4</b>, at most <b>30</b>), "
+                "then tap ✅ Done.\n"
+                "<i>No screenshots, logos, framed or blurry photos.</i>")
+            if len(photos) < 4:
+                await bot.send_message(chat_id,
+                    f"Only {len(photos)} photo(s). bina.az needs at least 4 — "
+                    "send more.")
+                continue
+            if len(photos) > 30:
+                photos = photos[:30]
+                await bot.send_message(chat_id, "Using the first 30 photos.")
+            break
         await flow.add_photos(photos)
 
         # contact
@@ -846,12 +873,11 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
 
         # review + submit
         summary = (f"<b>Review</b>\n"
-                   f"• {cat}, {'Sell' if deal=='sell' else 'Rent'}\n"
-                   f"• {rooms} rooms · {area} m² · floor {floor}/{total}\n"
+                   f"• {cat} · Sell\n"
+                   f"• {city} · {rooms} rooms · {area} m² · floor {floor}/{total}\n"
                    f"• Repair: {repair} · Price: {price} AZN\n"
                    f"• {len(photos)} photos\n\n"
-                   f"Tap Continue to submit the form (bina.az may then show a "
-                   f"package/preview step).")
+                   f"Tap Continue to submit (bina.az may then show a package step).")
         go = await ask.ask_choice(bot, chat_id, summary,
                                   [("▶️ Continue (Davam etmək)", "go")])
         if go != "go":
