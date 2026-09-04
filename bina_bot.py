@@ -87,15 +87,21 @@ class Flow(StatesGroup):
     ask_otp = State()
 
 
+_last_user_id: dict[int, int] = {}   # chat_id -> user_id, filled by middleware
+
+
 class Whitelist(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if user and user.id not in ALLOWED:
-            if isinstance(event, Message):
-                await event.answer("⛔️ Private bot.")
-            elif isinstance(event, CallbackQuery):
-                await event.answer("⛔️ Private bot.", show_alert=True)
-            return None
+        if user:
+            _current_uid.set(user.id)
+            _last_user_id[getattr(getattr(event, "chat", None), "id", user.id) or user.id] = user.id
+            if user.id not in ALLOWED:
+                if isinstance(event, Message):
+                    await event.answer("⛔️ Private bot.")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("⛔️ Private bot.", show_alert=True)
+                return None
         return await handler(event, data)
 
 
@@ -104,9 +110,14 @@ BTN_LOGIN = "🔑 Login"
 BTN_NEW = "➕ New listing"
 BTN_ADS = "📋 My ads"
 BTN_STATUS = "🩺 Status"
-BTN_LOGOUT = "🚪 Forget session"
-BTN_NEWSESSION = "🔄 New session"
+BTN_SESSIONS = "📱 Sessions"
 BTN_ADMIN = "🛠 Admin"
+
+# sessions sub-menu
+BTN_S_NEW = "➕ New session"
+BTN_S_SWITCH = "🔀 Switch number"
+BTN_S_LIST = "📄 My numbers"
+BTN_S_FORGET = "🚪 Forget session"
 
 # admin sub-menu
 BTN_A_PENDING = "⏳ Pending users"
@@ -116,17 +127,33 @@ BTN_A_SETTIER = "⭐ Set tier"
 BTN_A_BACK = "⬅️ Back"
 
 
+import contextvars
+_current_uid: contextvars.ContextVar = contextvars.ContextVar("uid", default=None)
+
+
 def main_menu(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    uid = user_id if user_id is not None else _current_uid.get()
     rows = [
         [KeyboardButton(text=BTN_NEW)],
-        [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_NEWSESSION)],
+        [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_SESSIONS)],
         [KeyboardButton(text=BTN_ADS), KeyboardButton(text=BTN_STATUS)],
-        [KeyboardButton(text=BTN_LOGOUT)],
     ]
-    if user_id is not None and user_id in ADMIN_IDS:
+    if uid is not None and uid in ADMIN_IDS:
         rows.append([KeyboardButton(text=BTN_ADMIN)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
                                input_field_placeholder="Tap a button…")
+
+
+def sessions_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_S_NEW), KeyboardButton(text=BTN_S_SWITCH)],
+            [KeyboardButton(text=BTN_S_LIST), KeyboardButton(text=BTN_S_FORGET)],
+            [KeyboardButton(text=BTN_A_BACK)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Sessions…",
+    )
 
 
 def admin_menu() -> ReplyKeyboardMarkup:
@@ -141,8 +168,28 @@ def admin_menu() -> ReplyKeyboardMarkup:
     )
 
 
+# Tracks each user's currently-active bina.az number (defaults to BINA_PHONE).
+_active_number: dict[int, str] = {}
+
+
+def active_phone(user_id: int) -> str | None:
+    if user_id in _active_number:
+        return _active_number[user_id]
+    nums = U.numbers(user_id)
+    if nums:
+        return nums[0]
+    return BINA_PHONE or None
+
+
 def phone_for(state_phone: str | None) -> str | None:
-    return state_phone or (BINA_PHONE or None)
+    if state_phone:
+        return state_phone
+    uid = _current_uid.get()
+    if uid is not None:
+        p = active_phone(uid)
+        if p:
+            return p
+    return BINA_PHONE or None
 
 
 # --------------------------------------------------------------------------
@@ -238,8 +285,8 @@ async def wizard_photo(msg: Message, bot: Bot):
         await msg.answer(f"couldn't save that photo: {exc}")
 
 
-MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_LOGOUT,
-              BTN_NEWSESSION, BTN_ADMIN,
+MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_SESSIONS, BTN_ADMIN,
+              BTN_S_NEW, BTN_S_SWITCH, BTN_S_LIST, BTN_S_FORGET,
               BTN_A_PENDING, BTN_A_USERS, BTN_A_SETSTATUS, BTN_A_SETTIER, BTN_A_BACK}
 
 
@@ -270,6 +317,7 @@ async def got_phone(msg: Message, state: FSMContext, bot: Bot):
     if not ok:
         await msg.answer(f"⚠️ {note}", reply_markup=main_menu(msg.from_user.id))
         return
+    _active_number[msg.from_user.id] = phone   # this number is now active
     await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
 
 
@@ -284,21 +332,84 @@ async def kb_login(msg: Message, state: FSMContext, bot: Bot):
     await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
 
 
-@dp.message(F.text == BTN_NEWSESSION)
-async def kb_newsession(msg: Message, state: FSMContext):
-    """Log in with ANOTHER number (subject to the user's tier cap)."""
+# ==================== SESSIONS SUBMENU (#2) ====================
+@dp.message(F.text == BTN_SESSIONS)
+async def kb_sessions(msg: Message):
+    await msg.answer("📱 <b>Sessions</b> — manage your connected numbers.",
+                     reply_markup=sessions_menu())
+
+
+@dp.message(F.text == BTN_S_LIST)
+async def kb_s_list(msg: Message):
     uid = msg.from_user.id
-    cap = U.max_numbers(uid)
-    have = len(U.numbers(uid))
+    nums = U.numbers(uid)
+    act = active_phone(uid)
+    lines = [f"<b>Your numbers</b> (tier {U.tier_of(uid)}, "
+             f"max {U.max_numbers(uid)})", ""]
+    if not nums and not act:
+        lines.append("None yet — use ➕ New session.")
+    for n in (nums or ([act] if act else [])):
+        star = " ⭐ active" if act and n.lstrip('+').endswith(mask(act)[-2:]) else ""
+        # show masked; mark active
+        is_act = (active_phone(uid) or "").lstrip('+')[-9:] == n.lstrip('+')[-9:]
+        lines.append(f"• {mask(n)}{' ⭐ active' if is_act else ''}")
+    await msg.answer("\n".join(lines), reply_markup=sessions_menu())
+
+
+@dp.message(F.text == BTN_S_NEW)
+async def kb_s_new(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    if U.get_user(uid) and U.get_user(uid)["status"] != "active" and uid not in ADMIN_IDS:
+        await msg.answer("⏳ Your account isn't active yet.", reply_markup=sessions_menu())
+        return
+    cap = U.max_numbers(uid); have = len(U.numbers(uid))
     if have >= cap:
-        await msg.answer(
-            f"Your tier ({U.tier_of(uid)}) allows {cap} number(s) and you have "
-            f"{have}. Ask an admin to upgrade your tier to add more.",
-            reply_markup=main_menu(uid))
+        await msg.answer(f"Your tier ({U.tier_of(uid)}) allows {cap} number(s); "
+                         f"you have {have}. Ask an admin to upgrade.",
+                         reply_markup=sessions_menu())
         return
     await state.set_state(Flow.ask_phone)
-    await msg.answer("🔄 Send the <b>other</b> bina.az number to connect "
-                     "(e.g. <code>0701112233</code>):")
+    await msg.answer("➕ Send the bina.az number to connect "
+                     "(e.g. <code>0701112233</code>). I'll send you the SMS step next.")
+
+
+@dp.message(F.text == BTN_S_SWITCH)
+async def kb_s_switch(msg: Message, bot: Bot, state: FSMContext):
+    uid = msg.from_user.id
+    nums = U.numbers(uid)
+    if len(nums) < 2:
+        await msg.answer("You only have one number. Add another with ➕ New session.",
+                         reply_markup=sessions_menu())
+        return
+    opts = [(mask(n), n) for n in nums]
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Busy — finish the current action first.")
+        return
+    async with lock_for(chat_id):
+        try:
+            chosen = await ask.ask_choice(bot, chat_id, "Switch active number to:", opts)
+            _active_number[uid] = chosen
+            await bot.send_message(chat_id, f"🔀 Active number is now {mask(chosen)}.",
+                                   reply_markup=sessions_menu())
+        except Cancelled:
+            await bot.send_message(chat_id, "Cancelled.", reply_markup=sessions_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Timed out.", reply_markup=sessions_menu())
+
+
+@dp.message(F.text == BTN_S_FORGET)
+async def kb_s_forget(msg: Message):
+    uid = msg.from_user.id
+    phone = active_phone(uid)
+    if phone:
+        sess = get_session(uid, phone)
+        sess.forget()
+        await sess.close()
+    await msg.answer(f"🚪 Session for {mask(phone) if phone else 'this number'} "
+                     "cleared. Next use needs an SMS code.",
+                     reply_markup=sessions_menu())
+# ==================== END SESSIONS SUBMENU ====================
 
 
 # ==================== ADMIN PANEL (#5, #6, #7) ====================
@@ -445,33 +556,13 @@ async def kb_status(msg: Message):
         reply_markup=main_menu())
 
 
-@dp.message(F.text == BTN_LOGOUT)
-async def kb_logout(msg: Message):
-    phone = phone_for(None)
-    uid = msg.from_user.id
-    if phone and (security.owner_of(phone) in (None, uid) or
-                  str(security.owner_of(phone)) == str(uid)):
-        sess = get_session(uid, phone)
-        sess.forget()
-        await sess.close()
-    await msg.answer("🚪 Saved session cleared. Next login needs an SMS code.\n"
-                     "<i>(You still own this number — it stays reserved to you.)</i>",
-                     reply_markup=main_menu())
-
-
 @dp.message(F.text == BTN_ADS)
-async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
-    phone = phone_for(None)
-    if not phone:
-        await msg.answer("Configure a number first (🔑 Login).")
-        return
-    if lock_for(msg.chat.id).locked():
-        await msg.answer("⏳ Busy — one action at a time.")
-        return
-    async with lock_for(msg.chat.id):
-        ok = await ensure_login(bot, msg.chat.id, msg.from_user.id, phone, state)
-        if ok:
-            await msg.answer("📋 You're logged in.", reply_markup=main_menu())
+async def kb_ads(msg: Message):
+    await msg.answer(
+        "📋 <b>My ads</b> — coming soon.\n"
+        "Reading and listing your existing ads isn't built yet. "
+        "For now you can create a new listing with ➕ New listing.",
+        reply_markup=main_menu())
 
 
 @dp.message(F.text == BTN_NEW)
