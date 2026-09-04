@@ -166,7 +166,6 @@ class PublishFlow:
         before = set(await self._scan_option_texts())
 
         await self._click(PUB[opener_key], f"open-{tag}")
-        await asyncio.sleep(1.2)
 
         if filter_text:
             try:
@@ -177,12 +176,17 @@ class PublishFlow:
             except Exception:
                 pass
 
-        await self.s.snapshot(f"publish-{tag}-open")
+        # Poll up to ~6s for the option overlay to render (React portal).
+        new: list[str] = []
+        for _ in range(12):
+            await asyncio.sleep(0.5)
+            after = await self._scan_option_texts()
+            new = [t for t in after if t not in before]
+            if len(new) >= 2:            # a real list appeared
+                break
 
-        after = await self._scan_option_texts()
-        # keep order, drop anything that was already on screen (the tabs)
-        new = [t for t in after if t not in before]
-        return new or after   # fall back to all if the diff came up empty
+        await self.s.snapshot(f"publish-{tag}-open")
+        return new or [t for t in (await self._scan_option_texts()) if t not in before]
 
     # Known tab/label texts that are never real dropdown options.
     _NON_OPTIONS = {

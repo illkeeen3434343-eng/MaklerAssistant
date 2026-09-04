@@ -712,30 +712,43 @@ async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
-                                filter_text=None, tag="dropdown", optional=False):
+                                filter_text=None, tag="dropdown", optional=False,
+                                known=None):
     """Open a bina.az dropdown, show its options as buttons, click the choice.
 
-    Long lists (e.g. 69 cities) are capped to the first 90 with a note. If no
-    options are found and optional=True, we keep the field's current value.
+    If live discovery finds nothing but a `known` option list is supplied, we
+    show those instead and click by visible text. Long lists are capped to 90.
+    If nothing is found and optional=True, we keep the field's current value.
     """
     options = await flow.discover_options(opener_key, filter_text=filter_text, tag=tag)
+    if not options and known:
+        await bot.send_message(chat_id, f"ℹ️ Using the known {tag} list.")
+        options = list(known)
     if not options:
         if optional:
             await bot.send_message(
                 chat_id, f"ℹ️ Couldn't read the {tag} options — keeping the "
-                         f"field's current value. (Snapshot saved.)")
+                         f"field's current value. (Use /debug to inspect.)")
             return None
         raise PublishError(
-            f"Opened the {tag} dropdown but found no options. A snapshot was "
-            f"saved to debug/ — send me the *-{tag}-open.html to pin it.")
+            f"Opened the {tag} dropdown but found no options. Run /debug and "
+            f"send me the *-{tag}-open.html to pin it.")
     note = ""
     if len(options) > 90:
         options = options[:90]
-        note = "\n<i>(showing first 90 — type in the field to filter if yours isn't here)</i>"
+        note = "\n<i>(first 90 shown)</i>"
     labeled = [(opt[:40], str(i)) for i, opt in enumerate(options)]
     chosen_idx = await ask.ask_choice(bot, chat_id, prompt + note, labeled)
     chosen_text = options[int(chosen_idx)]
-    await flow.pick_option(chosen_text, tag=tag)
+    try:
+        await flow.pick_option(chosen_text, tag=tag)
+    except PublishError:
+        # Clicking by text failed (option overlay differs) — tell the user but
+        # continue; the field may already hold an acceptable default.
+        if not optional:
+            raise
+        await bot.send_message(chat_id, f"⚠️ Couldn't click '{chosen_text}' — "
+                                        f"keeping the current {tag} value.")
     return chosen_text
 
 
@@ -765,8 +778,14 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.choose_owner(is_owner)
 
         # step 4 — the form
+        # Property type defaults to a valid value on the page; if we can't read
+        # the dropdown options, keep the default rather than fail the whole run.
         await _choose_from_dropdown(bot, chat_id, flow, "type_dropdown",
-                                    "Property type (Əmlakın növü)?", tag="type")
+                                    "Property type (Əmlakın növü)?", tag="type",
+                                    optional=True,
+                                    known=["Yeni tikili", "Köhnə tikili",
+                                           "Həyət evi/Bağ evi", "Ofis", "Qaraj",
+                                           "Torpaq", "Obyekt"])
         city = await _choose_from_dropdown(bot, chat_id, flow, "city_button",
                                            "City (Şəhər)?", tag="city", optional=True)
 
