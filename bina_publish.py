@@ -21,6 +21,7 @@ from playwright.async_api import TimeoutError as PWTimeout
 
 # --------------------------------------------------------------------------
 NEW_AD_URL = "https://bina.az/items/new"
+MY_ADS_URL = "https://bina.az/profile/items"
 
 PUB = {
     # entry
@@ -160,6 +161,45 @@ class PublishFlow:
         if "login" in low or "hello.bina.az" in low:
             raise PublishError("Not logged in — the new-ad page redirected to login.")
 
+    async def fetch_my_ads(self) -> list[dict]:
+        """Read the user's listings from /profile/items.
+
+        Returns a list of dicts: id, title, price, params, status, url.
+        Structure from the profile page: each card is [data-cy='item-card'].
+        """
+        await self.page.goto(MY_ADS_URL, wait_until="domcontentloaded")
+        await self.page.wait_for_load_state("networkidle")
+        await asyncio.sleep(2.0)
+        low = self.page.url.lower()
+        if "login" in low or "hello.bina.az" in low:
+            raise PublishError("Not logged in — profile redirected to login.")
+
+        ads = await self.page.evaluate(
+            """() => {
+                const out = [];
+                for (const card of document.querySelectorAll("[data-cy='item-card']")) {
+                    const link = card.querySelector("a[href*='/items/']");
+                    const href = link ? link.getAttribute('href') : '';
+                    const m = href.match(/\\/items\\/(\\d+)/);
+                    const priceEl = card.querySelector("[data-cy='item-card-price-full']");
+                    const titleEl = card.querySelector(".sc-c97f875-16");   // location line
+                    const params = Array.from(card.querySelectorAll(".sc-c97f875-17 span"))
+                                        .map(s => s.textContent.trim()).filter(Boolean);
+                    const statusEl = card.querySelector("[data-cy^='product-label']");
+                    out.push({
+                        id: m ? m[1] : '',
+                        url: href.startsWith('http') ? href : 'https://bina.az' + href,
+                        title: titleEl ? titleEl.textContent.trim() : '',
+                        price: priceEl ? priceEl.textContent.replace(/\\s/g,' ').trim() : '',
+                        params: params.join(', '),
+                        status: statusEl ? statusEl.textContent.trim() : '',
+                    });
+                }
+                return out;
+            }"""
+        )
+        return ads
+
     async def choose_deal(self, sell: bool):
         await self._click(PUB["deal_sell"] if sell else PUB["deal_rent"],
                           "deal-type")
@@ -174,6 +214,83 @@ class PublishFlow:
         await self._click(PUB["owner_self"] if is_owner else PUB["owner_agent"],
                           "owner-type")
         await asyncio.sleep(1.2)
+
+    async def _close_overlay(self):
+        """Press Escape / click empty space to dismiss an open dropdown overlay
+        so the next opener isn't blocked by it (the district-click failure)."""
+        try:
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.4)
+        except Exception:
+            pass
+
+    async def search_and_pick(self, opener_key: str, query: str, tag: str) -> list[str]:
+        """Open a search-dropdown, type `query`, return the visible result texts.
+
+        These bina.az fields (city, district, village) each contain a
+        data-cy='search-input'. Typing filters the list; we then read the
+        results so the caller can show them as buttons and pick one.
+        """
+        await self._close_overlay()
+        await self._click(PUB[opener_key], f"open-{tag}")
+        await asyncio.sleep(0.8)
+
+        # find the search box that just became active and type into it
+        typed = False
+        try:
+            box = self.page.locator(PUB["search_input"]).last
+            await box.wait_for(state="visible", timeout=4000)
+            await box.click()
+            await box.fill("")
+            if query:
+                await box.type(query, delay=60)
+                typed = True
+            await asyncio.sleep(1.0)
+        except Exception:
+            pass
+
+        before_skip = set(self._NON_OPTIONS)
+        results = []
+        for _ in range(10):
+            await asyncio.sleep(0.4)
+            results = [t for t in await self._scan_option_texts()
+                       if t not in before_skip]
+            if results:
+                break
+        await self.s.snapshot(f"publish-{tag}-open")
+        return results
+
+    async def pick_result(self, text: str, tag: str):
+        await self._click_text(text, tag)
+        await asyncio.sleep(1.0)
+
+    async def open_map_and_confirm(self):
+        """Click 'Xəritədə göstər' and confirm the map popup (#4).
+
+        Selectors are best-effort; the map confirm button text varies. Failures
+        are non-fatal — the address text field already sets the location.
+        """
+        try:
+            btn = self.page.locator("[data-cy='new-ad-select-on-map']").first
+            if await btn.count() and await btn.is_visible(timeout=2000):
+                await btn.click()
+                await asyncio.sleep(2.0)
+                # try common confirm buttons in the map popup
+                for sel in ["button:has-text('Təsdiq')", "button:has-text('OK')",
+                            "button:has-text('Seç')", "button:has-text('Hazır')",
+                            "[data-cy*='confirm']", "button[type='submit']"]:
+                    try:
+                        c = self.page.locator(sel).first
+                        if await c.count() and await c.is_visible(timeout=1500):
+                            await c.click()
+                            await asyncio.sleep(1.0)
+                            return True
+                    except Exception:
+                        continue
+                await self.s.snapshot("publish-map-open")
+        except Exception:
+            pass
+        return False
 
     async def discover_options(self, opener_key: str, filter_text: str | None = None,
                                tag: str = "dropdown") -> list[str]:

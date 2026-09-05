@@ -558,12 +558,57 @@ async def kb_status(msg: Message):
 
 
 @dp.message(F.text == BTN_ADS)
-async def kb_ads(msg: Message):
-    await msg.answer(
-        "📋 <b>My ads</b> — coming soon.\n"
-        "Reading and listing your existing ads isn't built yet. "
-        "For now you can create a new listing with ➕ New listing.",
-        reply_markup=main_menu())
+async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
+    phone = phone_for(None)
+    if not phone:
+        await msg.answer("Configure a number first (🔑 Login).")
+        return
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Busy — one action at a time.")
+        return
+    async with lock_for(chat_id):
+        ok = await ensure_login(bot, chat_id, msg.from_user.id, phone, state)
+        if not ok:
+            return
+        sess = get_session(msg.from_user.id, phone)
+        await bot.send_message(chat_id, "📋 Fetching your ads…")
+        try:
+            async with sess.lock:
+                ads = await PublishFlow(sess).fetch_my_ads()
+        except Exception as exc:
+            log.exception("fetch my ads")
+            await bot.send_message(chat_id, f"❌ Couldn't read your ads: {exc}",
+                                   reply_markup=main_menu())
+            return
+    if not ads:
+        await bot.send_message(chat_id, "You have no ads on this account yet.",
+                               reply_markup=main_menu())
+        return
+    lines = [f"📋 <b>Your ads ({len(ads)})</b> — {mask(phone)}", ""]
+    for a in ads:
+        line = f"🏠 <b>{a.get('title') or 'Ad'}</b>"
+        if a.get("price"):
+            line += f" — {a['price']} ₼"
+        lines.append(line)
+        if a.get("params"):
+            lines.append(f"   {a['params']}")
+        meta = []
+        if a.get("id"):
+            meta.append(f"id {a['id']}")
+        if a.get("status"):
+            meta.append(a["status"])
+        if meta:
+            lines.append("   " + " · ".join(meta))
+        lines.append("")
+    # chunk to stay under Telegram's 4096 limit
+    buf = ""
+    for ln in lines:
+        if len(buf) + len(ln) > 3500:
+            await bot.send_message(chat_id, buf)
+            buf = ""
+        buf += ln + "\n"
+    await bot.send_message(chat_id, buf or "—", reply_markup=main_menu())
 
 
 @dp.message(F.text == BTN_NEW)
@@ -753,33 +798,51 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
     return chosen_text
 
 
-async def _choose_city_paged(bot, chat_id, flow):
-    """Show cities 5 at a time with a 'Digər' (More) button until one is picked.
+async def _search_pick(bot, chat_id, flow, opener_key, label, tag, optional=False):
+    """Ask the user to type a search term, then show matching results as buttons.
 
-    Reselecting the city is what makes the Rayon dropdown appear for Bakı, so
-    we always go through the real dropdown rather than keeping the default.
+    bina.az city/district/village fields are search-dropdowns. The user types
+    e.g. 'Nizami', we read the filtered results and show them (5 at a time with
+    a 'Digər' more button).
     """
-    cities = await flow.discover_options("city_button", tag="city")
-    if not cities:
-        cities = ["Bakı"]  # fallback; at least let Bakı through
+    query = await ask.ask_text(
+        bot, chat_id,
+        f"{label} — type a few letters to search (or send <b>-</b> to skip)."
+        if optional else
+        f"{label} — type a few letters to search:")
+    if optional and query.strip() in ("-", "skip", "Skip"):
+        return None
+
+    results = await flow.search_and_pick(opener_key, query.strip(), tag=tag)
+    if not results:
+        if optional:
+            await bot.send_message(chat_id, f"No {tag} matches — skipping.")
+            return None
+        # let them retry once with a broader term
+        results = await flow.search_and_pick(opener_key, query.strip()[:2], tag=tag)
+        if not results:
+            raise PublishError(f"No {tag} results for '{query}'. Run /debug and "
+                               f"send me *-{tag}-open.html.")
+
     page = 0
     while True:
-        chunk = cities[page * 5:(page + 1) * 5]
-        opts = [(c[:40], f"c{page * 5 + i}") for i, c in enumerate(chunk)]
-        more = (page + 1) * 5 < len(cities)
-        if more:
+        chunk = results[page * 5:(page + 1) * 5]
+        opts = [(r[:40], f"r{page*5+i}") for i, r in enumerate(chunk)]
+        if (page + 1) * 5 < len(results):
             opts.append(("➡️ Digər (more)", "more"))
-        chosen = await ask.ask_choice(bot, chat_id, "City (Şəhər)?", opts)
+        opts.append(("🔁 Search again", "again"))
+        chosen = await ask.ask_choice(bot, chat_id, f"{label}: pick one", opts)
         if chosen == "more":
             page += 1
             continue
-        idx = int(chosen[1:])
-        city = cities[idx]
+        if chosen == "again":
+            return await _search_pick(bot, chat_id, flow, opener_key, label, tag, optional)
+        pick = results[int(chosen[1:])]
         try:
-            await flow.pick_option(city, tag="city")
+            await flow.pick_result(pick, tag=tag)
         except PublishError:
-            await bot.send_message(chat_id, f"⚠️ Couldn't select {city}; using default.")
-        return city
+            await bot.send_message(chat_id, f"⚠️ Couldn't select {pick}.")
+        return pick
 
 
 async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
@@ -805,22 +868,29 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         is_owner = who == "owner"
         await flow.choose_owner(is_owner)
 
-        # City — paginated 5-at-a-time with "Digər". Reselecting reveals Rayon.
-        city = await _choose_city_paged(bot, chat_id, flow)
+        # City — type-to-search then pick from results (paged 5 at a time).
+        city = await _search_pick(bot, chat_id, flow, "city_button", "City (Şəhər)",
+                                  tag="city")
 
         # Rayon (district) exists ONLY for Bakı.
         if (city or "").strip().lower() in ("bakı", "baki", "baku"):
-            await _choose_from_dropdown(bot, chat_id, flow, "district_button",
-                                        "District (Rayon)?", tag="district", optional=True)
-            try:
-                await _choose_from_dropdown(bot, chat_id, flow, "village_button",
-                                            "Settlement (Qəsəbə)?", tag="village",
-                                            optional=True)
-            except PublishError:
-                pass
+            await _search_pick(bot, chat_id, flow, "district_button",
+                               "District (Rayon)", tag="district", optional=True)
+            await _search_pick(bot, chat_id, flow, "village_button",
+                               "Settlement (Qəsəbə)", tag="village", optional=True)
 
         address = await ask.ask_text(bot, chat_id,
                                      "Exact address (Ünvan / dəqiq yerləşmə)?")
+
+        # Map: optionally pin the location on the map and confirm the popup (#4).
+        want_map = await ask.ask_choice(bot, chat_id,
+                                        "Set the location on the map?",
+                                        [("📍 Yes", "yes"), ("Skip", "no")])
+        if want_map == "yes":
+            ok = await flow.open_map_and_confirm()
+            await bot.send_message(chat_id,
+                "📍 Map location confirmed." if ok else
+                "⚠️ Couldn't auto-confirm the map — set it manually later if needed.")
 
         rooms = await ask.ask_text(bot, chat_id, "Number of rooms (Otaq sayı)?")
         area = await ask.ask_text(bot, chat_id, "Area in m² (Sahə)?")
@@ -887,11 +957,10 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
 
     await bot.send_message(
         chat_id,
-        "✅ Form submitted (clicked <b>Davam etmək</b>).\n"
-        f"Now on: <code>{final_url}</code>\n\n"
-        "⚠️ If bina.az shows a package/preview/publish step after this, that "
-        "part isn't automated yet — finish it in the browser, or send me that "
-        "page's HTML and I'll add it.",
+        "✅ <b>Listing submitted!</b>\n\n"
+        "Your ad has been sent to bina.az for review. Once their moderators "
+        "approve it, it goes live on the site.\n\n"
+        "Check status anytime with 📋 My ads.",
         reply_markup=main_menu())
 
 
