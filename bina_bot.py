@@ -798,31 +798,20 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
     return chosen_text
 
 
-async def _search_pick(bot, chat_id, flow, opener_key, label, tag, optional=False):
-    """Ask the user to type a search term, then show matching results as buttons.
+async def _pick_list(bot, chat_id, flow, opener_key, label, tag, optional=False):
+    """Open a bina.az search-dropdown and show ALL options as buttons directly.
 
-    bina.az city/district/village fields are search-dropdowns. The user types
-    e.g. 'Nizami', we read the filtered results and show them (5 at a time with
-    a 'Digər' more button).
+    No typing required — the full list is read from the opened dropdown and
+    paged 5 at a time with a 'Digər' (more) button. (city / district / village)
     """
-    query = await ask.ask_text(
-        bot, chat_id,
-        f"{label} — type a few letters to search (or send <b>-</b> to skip)."
-        if optional else
-        f"{label} — type a few letters to search:")
-    if optional and query.strip() in ("-", "skip", "Skip"):
-        return None
-
-    results = await flow.search_and_pick(opener_key, query.strip(), tag=tag)
+    # Empty query -> the dropdown shows its full option list.
+    results = await flow.search_and_pick(opener_key, "", tag=tag)
     if not results:
         if optional:
-            await bot.send_message(chat_id, f"No {tag} matches — skipping.")
+            await bot.send_message(chat_id, f"No {tag} options — skipping.")
             return None
-        # let them retry once with a broader term
-        results = await flow.search_and_pick(opener_key, query.strip()[:2], tag=tag)
-        if not results:
-            raise PublishError(f"No {tag} results for '{query}'. Run /debug and "
-                               f"send me *-{tag}-open.html.")
+        raise PublishError(f"No {tag} options found. Run /debug and send me "
+                           f"*-{tag}-open.html.")
 
     page = 0
     while True:
@@ -830,13 +819,10 @@ async def _search_pick(bot, chat_id, flow, opener_key, label, tag, optional=Fals
         opts = [(r[:40], f"r{page*5+i}") for i, r in enumerate(chunk)]
         if (page + 1) * 5 < len(results):
             opts.append(("➡️ Digər (more)", "more"))
-        opts.append(("🔁 Search again", "again"))
-        chosen = await ask.ask_choice(bot, chat_id, f"{label}: pick one", opts)
+        chosen = await ask.ask_choice(bot, chat_id, f"{label}:", opts)
         if chosen == "more":
             page += 1
             continue
-        if chosen == "again":
-            return await _search_pick(bot, chat_id, flow, opener_key, label, tag, optional)
         pick = results[int(chosen[1:])]
         try:
             await flow.pick_result(pick, tag=tag)
@@ -861,23 +847,25 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                                     ("Köhnə tikili", "Köhnə tikili")])
         await flow.choose_category(cat)
 
-        # Owner vs agent
-        who = await ask.ask_choice(bot, chat_id, "You are the…",
-                                   [("Owner (Elanın sahibi)", "owner"),
-                                    ("Agent (Vasitəçi)", "agent")])
-        is_owner = who == "owner"
+        # Owner vs agent — HIDDEN for now, defaults to Agent.
+        # To re-enable later, uncomment the ask_choice block below.
+        # who = await ask.ask_choice(bot, chat_id, "You are the…",
+        #                            [("Owner (Elanın sahibi)", "owner"),
+        #                             ("Agent (Vasitəçi)", "agent")])
+        # is_owner = who == "owner"
+        is_owner = False          # default: agent (Mən vasitəçiyəm)
         await flow.choose_owner(is_owner)
 
-        # City — type-to-search then pick from results (paged 5 at a time).
-        city = await _search_pick(bot, chat_id, flow, "city_button", "City (Şəhər)",
-                                  tag="city")
+        # City — show buttons directly (no typing), paged 5 at a time.
+        city = await _pick_list(bot, chat_id, flow, "city_button", "City (Şəhər)",
+                                tag="city")
 
-        # Rayon (district) exists ONLY for Bakı.
+        # Rayon (district) exists ONLY for Bakı; shown the same way as cities.
         if (city or "").strip().lower() in ("bakı", "baki", "baku"):
-            await _search_pick(bot, chat_id, flow, "district_button",
-                               "District (Rayon)", tag="district", optional=True)
-            await _search_pick(bot, chat_id, flow, "village_button",
-                               "Settlement (Qəsəbə)", tag="village", optional=True)
+            await _pick_list(bot, chat_id, flow, "district_button",
+                             "District (Rayon)", tag="district", optional=True)
+            await _pick_list(bot, chat_id, flow, "village_button",
+                             "Settlement (Qəsəbə)", tag="village", optional=True)
 
         address = await ask.ask_text(bot, chat_id,
                                      "Exact address (Ünvan / dəqiq yerləşmə)?")

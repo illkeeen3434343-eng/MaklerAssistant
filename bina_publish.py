@@ -89,11 +89,23 @@ class PublishFlow:
 
     # -------------------------------------------------------------- helpers
     async def _click(self, selector: str, what: str, timeout: int = 8000):
+        loc = self.page.locator(selector).first
         try:
-            loc = self.page.locator(selector).first
-            await loc.wait_for(state="visible", timeout=timeout)
-            await loc.click()
-        except PWTimeout as exc:
+            await loc.wait_for(state="attached", timeout=timeout)
+            await loc.scroll_into_view_if_needed(timeout=4000)
+            await loc.click(timeout=4000)
+            return
+        except Exception:
+            pass
+        # An open dropdown overlay may be covering the target — close it and
+        # force the click (bypasses the "intercepts pointer events" check).
+        try:
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+            await loc.scroll_into_view_if_needed(timeout=4000)
+            await loc.click(timeout=4000, force=True)
+            return
+        except Exception as exc:
             await self.s.snapshot(f"publish-{what}")
             raise PublishError(f"Could not click {what} ({selector}).") from exc
 
@@ -295,7 +307,11 @@ class PublishFlow:
         if not clicked:
             await self.s.snapshot(f"publish-pick-{tag}")
             raise PublishError(f"Couldn't click '{text}' in the {tag} list.")
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.0)
+        # Close the overlay so the next dropdown opener (e.g. district) is
+        # clickable and not covered by this list.
+        await self._close_overlay()
+        await asyncio.sleep(0.5)
 
     async def open_map_and_confirm(self):
         """Click 'Xəritədə göstər' and confirm the map popup (#4).
