@@ -174,10 +174,12 @@ class PublishFlow:
             raise PublishError("Not logged in — the new-ad page redirected to login.")
 
     async def fetch_my_ads(self) -> list[dict]:
-        """Read the user's listings from /profile/items.
+        """Read the user's listings from /profile/items, across ALL status tabs.
 
-        Returns a list of dicts: id, title, price, params, status, url.
-        Structure from the profile page: each card is [data-cy='item-card'].
+        The profile page filters by tab (All / Pending / Live / Rejected …).
+        Rejected ads sit under their own tab, so we click 'Bütün elanlar'
+        (data-stat='profile-all-tab') first, then also sweep each tab and merge
+        by id so nothing is missed.
         """
         await self.page.goto(MY_ADS_URL, wait_until="domcontentloaded")
         await self.page.wait_for_load_state("networkidle")
@@ -186,31 +188,57 @@ class PublishFlow:
         if "login" in low or "hello.bina.az" in low:
             raise PublishError("Not logged in — profile redirected to login.")
 
-        ads = await self.page.evaluate(
-            """() => {
-                const out = [];
-                for (const card of document.querySelectorAll("[data-cy='item-card']")) {
-                    const link = card.querySelector("a[href*='/items/']");
-                    const href = link ? link.getAttribute('href') : '';
-                    const m = href.match(/\\/items\\/(\\d+)/);
-                    const priceEl = card.querySelector("[data-cy='item-card-price-full']");
-                    const titleEl = card.querySelector(".sc-c97f875-16");   // location line
-                    const params = Array.from(card.querySelectorAll(".sc-c97f875-17 span"))
-                                        .map(s => s.textContent.trim()).filter(Boolean);
-                    const statusEl = card.querySelector("[data-cy^='product-label']");
-                    out.push({
-                        id: m ? m[1] : '',
-                        url: href.startsWith('http') ? href : 'https://bina.az' + href,
-                        title: titleEl ? titleEl.textContent.trim() : '',
-                        price: priceEl ? priceEl.textContent.replace(/\\s/g,' ').trim() : '',
-                        params: params.join(', '),
-                        status: statusEl ? statusEl.textContent.trim() : '',
-                    });
-                }
-                return out;
-            }"""
-        )
-        return ads
+        scrape_js = """() => {
+            const out = [];
+            for (const card of document.querySelectorAll("[data-cy='item-card']")) {
+                const link = card.querySelector("a[href*='/items/']");
+                const href = link ? link.getAttribute('href') : '';
+                const m = href.match(/\\/items\\/(\\d+)/);
+                const priceEl = card.querySelector("[data-cy='item-card-price-full']");
+                const titleEl = card.querySelector(".sc-c97f875-16");
+                const params = Array.from(card.querySelectorAll(".sc-c97f875-17 span"))
+                                    .map(s => s.textContent.trim()).filter(Boolean);
+                const statusEl = card.querySelector("[data-cy^='product-label']");
+                out.push({
+                    id: m ? m[1] : '',
+                    url: href.startsWith('http') ? href : 'https://bina.az' + href,
+                    title: titleEl ? titleEl.textContent.trim() : '',
+                    price: priceEl ? priceEl.textContent.replace(/\\s/g,' ').trim() : '',
+                    params: params.join(', '),
+                    status: statusEl ? statusEl.textContent.trim() : '',
+                });
+            }
+            return out;
+        }"""
+
+        merged: dict[str, dict] = {}
+
+        async def sweep():
+            for ad in await self.page.evaluate(scrape_js):
+                if ad.get("id"):
+                    merged[ad["id"]] = ad
+
+        # Try each filter tab so every status (incl. rejected) is captured.
+        tab_stats = ["profile-all-tab", "profile-published-tab",
+                     "profile-pending-tab", "profile-rejected-tab",
+                     "profile-expired-tab", "profile-validated-tab"]
+        clicked_any = False
+        for stat in tab_stats:
+            try:
+                tab = self.page.locator(f"[data-stat='{stat}']").first
+                if await tab.count():
+                    await tab.click()
+                    clicked_any = True
+                    await asyncio.sleep(1.2)
+                    await sweep()
+            except Exception:
+                continue
+
+        if not clicked_any:
+            # no tabs found — just scrape whatever is shown
+            await sweep()
+
+        return list(merged.values())
 
     async def choose_deal(self, sell: bool):
         await self._click(PUB["deal_sell"] if sell else PUB["deal_rent"],
@@ -247,10 +275,23 @@ class PublishFlow:
     async def search_and_pick(self, opener_key: str, query: str, tag: str) -> list[str]:
         """Open a search-dropdown, type `query`, return the option label texts.
 
-        Reads the radio-row labels (span[data-cy='city']) rather than guessing
-        at <li> elements — that's the real markup for city/district/village.
+        Reads the radio-row labels rather than <li> elements — that's the real
+        markup for city/district/village. For district/village, the opener
+        itself appears only a moment after the city is chosen, so we wait for
+        it before clicking.
         """
         await self._close_overlay()
+        await asyncio.sleep(0.4)
+
+        # The district/village opener renders after the city is picked — wait
+        # for it to exist and be enabled before clicking.
+        try:
+            opener = self.page.locator(PUB[opener_key]).first
+            await opener.wait_for(state="visible", timeout=8000)
+            await asyncio.sleep(0.6)      # let it settle/enable
+        except Exception:
+            pass
+
         await self._click(PUB[opener_key], f"open-{tag}")
         await asyncio.sleep(0.8)
 
@@ -266,7 +307,7 @@ class PublishFlow:
             pass
 
         results: list[str] = []
-        for _ in range(10):
+        for _ in range(15):               # poll up to ~6s for options to render
             await asyncio.sleep(0.4)
             results = await self.page.evaluate(
                 """(sel) => Array.from(document.querySelectorAll(sel))
