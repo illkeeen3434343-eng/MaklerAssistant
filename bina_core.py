@@ -45,7 +45,11 @@ SELECTORS = {
     "phone_choice": "text=Telefon nömrəsi",
     "phone_input": "#phone-field, input[type='tel'], input[name*='phone'], input[name*='number']",
     "phone_submit": "button:has-text('SMS-kod')",
-    "otp_input": "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code'], input[inputmode='numeric']:not([data-cy='phone-input']), input[type='tel']:not([data-cy='phone-input']), input.masked-input-field",
+    # The real code field: <input id="sms-code-field" ...> — no name/type/data-cy.
+    "otp_input": "#sms-code-field, input[inputmode='numeric']:not(#phone-field):not([data-cy='phone-input'])",
+    # The code page has NO submit button (only 'resend'); it auto-submits, so
+    # otp_submit is intentionally empty and we rely on typing + Enter.
+    "otp_submit": "",
     "otp_submit": "button[type='submit'], button:has-text('Təsdiq'), button:has-text('Daxil')",
     "otp_error": ".error, .invalid-feedback, [role='alert']",
     "logged_in": "a[href*='/profile'], a[href*='/items/my'], a[href*='logout']",
@@ -348,7 +352,12 @@ class BinaSession:
         await field.fill("")
         await field.type(code, delay=110)
         await asyncio.sleep(0.6)
-        if not await self._click_first([SELECTORS["otp_submit"]] + SUBMIT_BUTTONS):
+        # The code page has no submit button (only 'resend'), and clicking any
+        # 'SMS-kod' button would RESEND the code. So submit with Enter only,
+        # unless an explicit otp_submit selector is configured.
+        if SELECTORS.get("otp_submit"):
+            await self._click_first([SELECTORS["otp_submit"]])
+        else:
             await field.press("Enter")
         await self._page.wait_for_load_state("networkidle")
         await self._pause()
