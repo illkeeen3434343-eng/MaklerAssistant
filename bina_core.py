@@ -281,18 +281,26 @@ class BinaSession:
         # Wait for the OTP field to actually appear before we ask the user.
         return await self._wait_for_otp_field()
 
-    async def _wait_for_otp_field(self, timeout: float = 20.0) -> bool:
-        """Poll for the SMS-code input to render after the phone is submitted."""
+    async def _wait_for_otp_field(self, timeout: float = 25.0) -> bool:
+        """Poll for the SMS-code input after the phone is submitted.
+
+        Returns True only when the real code field is present. Stops early and
+        returns False if we've navigated AWAY from the auth service (which
+        means login auto-completed and no code is needed) — so we never type a
+        code into the wrong input (e.g. the homepage search box).
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            url = (self._page.url or "").lower()
+            # left the auth service -> logged in, no OTP field will appear
+            if "hello.bina.az" not in url and "authentication" not in url:
+                return False
             try:
-                f = self._page.locator(SELECTORS["otp_input"]).first
+                f = self._page.locator("#sms-code-field").first
                 if await f.count() and await f.is_visible():
                     return True
-                # also accept the fallback (any visible non-phone input)
-                fb = self._page.locator(
-                    "input:visible:not([data-cy='phone-input']):not([disabled])").first
-                if await fb.count() and await fb.is_visible():
+                f2 = self._page.locator(SELECTORS["otp_input"]).first
+                if await f2.count() and await f2.is_visible():
                     return True
             except Exception:
                 pass
@@ -321,23 +329,21 @@ class BinaSession:
         return False
 
     async def _otp_locator(self):
-        """Return a locator for the OTP field, trying the known selector first,
-        then a fallback: the first visible input that is NOT the phone field."""
-        f = self._page.locator(SELECTORS["otp_input"]).first
-        try:
-            if await f.count() and await f.is_visible():
-                return f
-        except Exception:
-            pass
-        # fallback: any visible input other than the disabled phone field
-        fb = self._page.locator(
-            "input:visible:not([data-cy='phone-input']):not([disabled])").first
-        try:
-            if await fb.count():
-                return fb
-        except Exception:
-            pass
-        return f  # last resort (will error and snapshot)
+        """Return the SMS-code field locator (strictly #sms-code-field first).
+
+        No broad 'any visible input' fallback — that risked grabbing the
+        homepage search box and typing the code there.
+        """
+        for sel in ("#sms-code-field", SELECTORS["otp_input"]):
+            if not sel:
+                continue
+            loc = self._page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible():
+                    return loc
+            except Exception:
+                continue
+        return self._page.locator("#sms-code-field").first  # will error + snapshot
 
     async def _submit_otp(self, code: str) -> None:
         field = await self._otp_locator()
@@ -385,11 +391,18 @@ class BinaSession:
             await self.snapshot("no-auth-form")
             raise LoginError("Could not reach the phone form on hello.bina.az.")
 
+        # Submitting the phone can lead to two outcomes:
+        #  (a) the SMS-code field appears  -> we need an OTP, or
+        #  (b) bina.az auto-completes login (valid prior session) -> no OTP.
         otp_ready = await self._type_phone()
         if not otp_ready:
+            # Maybe it auto-logged-in instead of showing the code field.
+            if await self.is_logged_in():
+                await self._save()
+                return True
             raise LoginError(
-                "Entered the phone number but the SMS-code field never appeared. "
-                "Run /debug and send me otp-field-missing.html.")
+                "Nömrə daxil edildi, amma SMS xanası görünmədi. /debug yazıb "
+                "otp-field-missing.html faylını göndərin.")
 
         error: str | None = None
         for attempt in range(1, OTP_MAX_ATTEMPTS + 1):
