@@ -87,6 +87,7 @@ def lock_for(chat_id: int) -> asyncio.Lock:
 class Flow(StatesGroup):
     ask_phone = State()
     ask_otp = State()
+    report = State()
 
 
 _last_user_id: dict[int, int] = {}   # chat_id -> user_id, filled by middleware
@@ -120,6 +121,8 @@ BTN_S_NEW = "➕ New session"
 BTN_S_SWITCH = "🔀 Switch number"
 BTN_S_LIST = "📄 My numbers"
 BTN_S_FORGET = "🚪 Forget session"
+BTN_S_REMOVE = "🗑 Remove number"
+BTN_CONTACT = "✉️ Contact / Report"
 
 # admin sub-menu
 BTN_A_PENDING = "⏳ Pending users"
@@ -138,6 +141,7 @@ def main_menu(user_id: int | None = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_NEW)],
         [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_SESSIONS)],
         [KeyboardButton(text=BTN_ADS), KeyboardButton(text=BTN_STATUS)],
+        [KeyboardButton(text=BTN_CONTACT)],
     ]
     if uid is not None and uid in ADMIN_IDS:
         rows.append([KeyboardButton(text=BTN_ADMIN)])
@@ -150,6 +154,7 @@ def sessions_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_S_NEW), KeyboardButton(text=BTN_S_SWITCH)],
             [KeyboardButton(text=BTN_S_LIST), KeyboardButton(text=BTN_S_FORGET)],
+            [KeyboardButton(text=BTN_S_REMOVE)],
             [KeyboardButton(text=BTN_A_BACK)],
         ],
         resize_keyboard=True,
@@ -287,7 +292,8 @@ async def wizard_photo(msg: Message, bot: Bot):
 
 
 MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_SESSIONS, BTN_ADMIN,
-              BTN_S_NEW, BTN_S_SWITCH, BTN_S_LIST, BTN_S_FORGET,
+              BTN_S_NEW, BTN_S_SWITCH, BTN_S_LIST, BTN_S_FORGET, BTN_S_REMOVE,
+              BTN_CONTACT,
               BTN_A_PENDING, BTN_A_USERS, BTN_A_SETSTATUS, BTN_A_SETTIER, BTN_A_BACK}
 
 
@@ -331,6 +337,51 @@ async def kb_login(msg: Message, state: FSMContext, bot: Bot):
         await msg.answer("📱 Send your bina.az number (e.g. <code>0557778899</code>):")
         return
     await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
+
+
+# ==================== CONTACT / REPORT ====================
+@dp.message(F.text == BTN_CONTACT)
+async def kb_contact(msg: Message, state: FSMContext):
+    await state.set_state(Flow.report)
+    await msg.answer(
+        "✉️ <b>Contact / Report an issue</b>\n\n"
+        "Describe your problem or request in one message and I'll pass it to "
+        "the admin. (e.g. \"Please move my number 0557778899 to another "
+        "account\" or a bug you hit.)\n\n"
+        "<i>Send /cancel to stop.</i>")
+
+
+@dp.message(Flow.report)
+async def got_report(msg: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    text = (msg.text or "").strip()
+    if not text or text.lower() in ("/cancel", "/stop"):
+        await msg.answer("Cancelled.", reply_markup=main_menu(msg.from_user.id))
+        return
+    uid = msg.from_user.id
+    uname = f"@{msg.from_user.username}" if msg.from_user.username else "(no username)"
+    if not ADMIN_IDS:
+        await msg.answer("⚠️ No admin is configured to receive reports.",
+                         reply_markup=main_menu(uid))
+        return
+    forwarded = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📩 <b>New report</b>\n"
+                f"From: <code>{uid}</code> {uname}\n"
+                f"Tier: {U.tier_of(uid)} · Status: "
+                f"{(U.get_user(uid) or {}).get('status','?')}\n\n"
+                f"{text}")
+            forwarded += 1
+        except Exception:
+            pass
+    await msg.answer(
+        "✅ Sent to the admin. They'll get back to you." if forwarded else
+        "⚠️ Couldn't reach the admin right now — please try again later.",
+        reply_markup=main_menu(uid))
+# ==================== END CONTACT / REPORT ====================
 
 
 # ==================== SESSIONS SUBMENU (#2) ====================
@@ -407,9 +458,46 @@ async def kb_s_forget(msg: Message):
         sess = get_session(uid, phone)
         sess.forget()
         await sess.close()
-    await msg.answer(f"🚪 Session for {mask(phone) if phone else 'this number'} "
-                     "cleared. Next use needs an SMS code.",
-                     reply_markup=sessions_menu())
+    await msg.answer(
+        f"🚪 Login session for {mask(phone) if phone else 'this number'} cleared "
+        "— the next action will ask for a fresh SMS code.\n\n"
+        "<i>The number stays connected to your account. To remove it entirely, "
+        "use 🗑 Remove number.</i>",
+        reply_markup=sessions_menu())
+
+
+@dp.message(F.text == BTN_S_REMOVE)
+async def kb_s_remove(msg: Message, bot: Bot, state: FSMContext):
+    uid = msg.from_user.id
+    nums = U.numbers(uid)
+    if not nums:
+        await msg.answer("You have no connected numbers.", reply_markup=sessions_menu())
+        return
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Busy — finish the current action first.")
+        return
+    async with lock_for(chat_id):
+        try:
+            opts = [(mask(n), n) for n in nums]
+            chosen = await ask.ask_choice(bot, chat_id,
+                "Which number to remove from your account?", opts)
+            # clear its saved session, drop it from the user's list
+            sess = get_session(uid, chosen)
+            sess.forget()
+            await sess.close()
+            U.remove_number(uid, chosen)
+            _active_number.pop(uid, None)
+            await bot.send_message(chat_id,
+                f"🗑 Removed {mask(chosen)} from your account.\n\n"
+                "<i>Note: the number stays reserved to your Telegram ID for "
+                "privacy. To reassign it to someone else, contact an admin via "
+                "✉️ Contact / Report.</i>",
+                reply_markup=sessions_menu())
+        except Cancelled:
+            await bot.send_message(chat_id, "Cancelled.", reply_markup=sessions_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Timed out.", reply_markup=sessions_menu())
 # ==================== END SESSIONS SUBMENU ====================
 
 
