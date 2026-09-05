@@ -309,8 +309,8 @@ async def got_otp(msg: Message):
     fut = _otp_waiters.get(msg.chat.id)
     if fut and not fut.done():
         fut.set_result(msg.text)
-        # Acknowledge FIRST, then delete — so the code never looks "lost".
-        await msg.answer("🔑 Code received, thanks.")
+        # Acknowledge FIRST, then delete the code for privacy.
+        await msg.answer("🔑 Kod alındı, təsdiqlənir…")
         try:
             await msg.delete()
         except Exception:

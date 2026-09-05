@@ -285,21 +285,65 @@ class BinaSession:
                 f = self._page.locator(SELECTORS["otp_input"]).first
                 if await f.count() and await f.is_visible():
                     return True
+                # also accept the fallback (any visible non-phone input)
+                fb = self._page.locator(
+                    "input:visible:not([data-cy='phone-input']):not([disabled])").first
+                if await fb.count() and await fb.is_visible():
+                    return True
             except Exception:
                 pass
             await asyncio.sleep(0.5)
+        # Not found with known selectors — inventory ALL inputs for debugging
+        # and try a smart fallback (any visible text/number input that isn't
+        # the phone field).
         await self.snapshot("otp-field-missing")
+        try:
+            inv = await self._page.evaluate(
+                """() => Array.from(document.querySelectorAll('input'))
+                     .filter(el => el.getClientRects().length)
+                     .map(el => ({
+                        name: el.getAttribute('name') || '',
+                        type: el.getAttribute('type') || '',
+                        cy: el.getAttribute('data-cy') || '',
+                        placeholder: el.getAttribute('placeholder') || '',
+                        inputmode: el.getAttribute('inputmode') || '',
+                        maxlength: el.getAttribute('maxlength') || '',
+                        cls: el.className || '',
+                     }))"""
+            )
+            _log(f"OTP field not found. Visible inputs on page: {inv}")
+        except Exception:
+            pass
         return False
 
+    async def _otp_locator(self):
+        """Return a locator for the OTP field, trying the known selector first,
+        then a fallback: the first visible input that is NOT the phone field."""
+        f = self._page.locator(SELECTORS["otp_input"]).first
+        try:
+            if await f.count() and await f.is_visible():
+                return f
+        except Exception:
+            pass
+        # fallback: any visible input other than the disabled phone field
+        fb = self._page.locator(
+            "input:visible:not([data-cy='phone-input']):not([disabled])").first
+        try:
+            if await fb.count():
+                return fb
+        except Exception:
+            pass
+        return f  # last resort (will error and snapshot)
+
     async def _submit_otp(self, code: str) -> None:
-        field = self._page.locator(SELECTORS["otp_input"]).first
+        field = await self._otp_locator()
         try:
             await field.wait_for(state="visible", timeout=8000)
         except Exception:
             await self.snapshot("otp-field-missing")
             raise LoginError(
-                "The SMS-code field didn't appear. Run /debug and send me "
-                "otp-field-missing.html so I can fix the selector.")
+                "SMS kod xanası tapılmadı. /debug yazıb otp-field-missing.html "
+                "faylını göndərin ki, seçicini düzəldim.")
         await field.click()
         await field.fill("")
         await field.type(code, delay=110)
