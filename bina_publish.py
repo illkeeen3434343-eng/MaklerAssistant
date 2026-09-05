@@ -183,9 +183,9 @@ class PublishFlow:
         """
         await self.page.goto(MY_ADS_URL, wait_until="domcontentloaded")
         await self.page.wait_for_load_state("networkidle")
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(2.5)
         low = self.page.url.lower()
-        if "login" in low or "hello.bina.az" in low:
+        if "login" in low or "hello.bina.az" in low or "authentication" in low:
             raise PublishError("Not logged in — profile redirected to login.")
 
         scrape_js = """() => {
@@ -214,30 +214,34 @@ class PublishFlow:
         merged: dict[str, dict] = {}
 
         async def sweep():
+            # give cards a moment to render after a tab switch
+            for _ in range(6):
+                cards = await self.page.locator("[data-cy='item-card']").count()
+                if cards:
+                    break
+                await asyncio.sleep(0.5)
             for ad in await self.page.evaluate(scrape_js):
                 if ad.get("id"):
                     merged[ad["id"]] = ad
 
-        # Try each filter tab so every status (incl. rejected) is captured.
-        tab_stats = ["profile-all-tab", "profile-published-tab",
-                     "profile-pending-tab", "profile-rejected-tab",
+        # Scrape whatever is shown on first load, THEN sweep each tab.
+        await sweep()
+        tab_stats = ["profile-all-tab", "profile-rejected-tab",
+                     "profile-published-tab", "profile-pending-tab",
                      "profile-expired-tab", "profile-validated-tab"]
-        clicked_any = False
         for stat in tab_stats:
             try:
                 tab = self.page.locator(f"[data-stat='{stat}']").first
                 if await tab.count():
                     await tab.click()
-                    clicked_any = True
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(1.5)
                     await sweep()
             except Exception:
                 continue
 
-        if not clicked_any:
-            # no tabs found — just scrape whatever is shown
-            await sweep()
-
+        # Debug snapshot if we still found nothing, so we can see the page.
+        if not merged:
+            await self.s.snapshot("myads-empty")
         return list(merged.values())
 
     async def choose_deal(self, sell: bool):

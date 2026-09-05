@@ -205,11 +205,30 @@ class BinaSession:
 
     # ---- auth ----
     async def is_logged_in(self) -> bool:
+        """True only if we're logged in AND as THIS session's phone number.
+
+        Just checking that /items/my loads isn't enough — a leftover cookie
+        from a different number would pass and skip OTP for the new number.
+        We confirm the account's own phone (shown on the profile) matches.
+        """
         await self._page.goto(MY_ITEMS_URL, wait_until="domcontentloaded")
         await asyncio.sleep(1.5)
         low = self._page.url.lower()
         bounced = ("login" in low) or ("hello.bina.az" in low) or ("authentication" in low)
-        return (not bounced) and "/items/my" in low
+        if bounced or "/items/my" not in low:
+            return False
+        # Verify identity: the profile shows the account's own phone number.
+        try:
+            body = await self._page.evaluate("() => document.body.innerText || ''")
+        except Exception:
+            body = ""
+        digits_here = re.sub(r"\D", "", body)
+        want = self.local[-7:]           # last 7 digits are enough to distinguish
+        if want and want in digits_here:
+            return True
+        # Couldn't confirm this phone → treat as NOT logged in (forces OTP).
+        _log(f"logged-in check: phone {mask(self.phone)} not confirmed on page")
+        return False
 
     async def _open_auth(self) -> bool:
         await self._page.goto(AUTH_URL, wait_until="domcontentloaded")

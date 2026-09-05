@@ -814,6 +814,24 @@ async def cb_myads(call: CallbackQuery, bot: Bot, state: FSMContext):
 PUBLISHER_NAME = os.getenv("PUBLISHER_NAME", "").strip()
 PUBLISHER_EMAIL = os.getenv("PUBLISHER_EMAIL", "").strip()
 
+# Known lists from cities.txt — used to build the choice buttons so the user
+# always sees correct names, independent of live-scrape quirks.
+CITIES = [
+    "Ağcabədi","Ağdam","Ağdaş","Ağdərə","Ağstafa","Ağsu","Astara","Bakı","Balakən",
+    "Beyləqan","Bərdə","Biləsuvar","Cəbrayıl","Cəlilabad","Daşkəsən","Füzuli",
+    "Gədəbəy","Gəncə","Goranboy","Göyçay","Göygöl","Göytəpə","Hacıqabul","Xaçmaz",
+    "Xankəndi","Xırdalan","Xızı","Xocalı","Xocavənd","Xudat","İmişli","İsmayıllı",
+    "Kəlbəcər","Kürdəmir","Qax","Qazax","Qəbələ","Qobustan","Quba","Qubadlı","Qusar",
+    "Laçın","Lerik","Lənkəran","Masallı","Mingəçevir","Naftalan","Naxçıvan",
+    "Naxçıvan MR","Neftçala","Oğuz","Saatlı","Sabirabad","Salyan","Samux","Siyəzən",
+    "Sumqayıt","Şabran","Şamaxı","Şəki","Şəmkir","Şirvan","Şuşa","Tərtər","Tovuz",
+    "Ucar","Yardımlı","Yevlax","Zaqatala","Zəngilan","Zərdab",
+]
+BAKU_DISTRICTS = [
+    "Abşeron","Binəqədi","Xətai","Xəzər","Qaradağ","Nərimanov","Nəsimi","Nizami",
+    "Pirallahı","Sabunçu","Səbail","Suraxanı","Yasamal",
+]
+
 
 @dp.callback_query(F.data == "newlisting")
 async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
@@ -886,37 +904,49 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
     return chosen_text
 
 
-async def _pick_list(bot, chat_id, flow, opener_key, label, tag, optional=False):
-    """Open a bina.az search-dropdown and show ALL options as buttons directly.
+async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
+                     known=None, optional=False):
+    """Show the option buttons (from a known list), then select on the page.
 
-    No typing required — the full list is read from the opened dropdown and
-    paged 5 at a time with a 'Digər' (more) button. (city / district / village)
+    The choice buttons come from `known` (guaranteed-correct names). Once the
+    user picks, we open the dropdown, TYPE that name into its search box, and
+    click the matching radio row — which is robust and avoids relying on
+    scraping the full list. Falls back to live scraping if no known list.
     """
-    # Empty query -> the dropdown shows its full option list.
-    results = await flow.search_and_pick(opener_key, "", tag=tag)
-    if not results:
+    options = list(known) if known else await flow.search_and_pick(opener_key, "", tag=tag)
+    if not options:
         if optional:
             await bot.send_message(chat_id, f"No {tag} options — skipping.")
             return None
-        raise PublishError(f"No {tag} options found. Run /debug and send me "
-                           f"*-{tag}-open.html.")
+        raise PublishError(f"No {tag} options. Run /debug, send *-{tag}-open.html.")
 
     page = 0
     while True:
-        chunk = results[page * 5:(page + 1) * 5]
+        chunk = options[page * 5:(page + 1) * 5]
         opts = [(r[:40], f"r{page*5+i}") for i, r in enumerate(chunk)]
-        if (page + 1) * 5 < len(results):
+        if (page + 1) * 5 < len(options):
             opts.append(("➡️ Digər (more)", "more"))
         chosen = await ask.ask_choice(bot, chat_id, f"{label}:", opts)
         if chosen == "more":
             page += 1
             continue
-        pick = results[int(chosen[1:])]
-        try:
-            await flow.pick_result(pick, tag=tag)
-        except PublishError:
-            await bot.send_message(chat_id, f"⚠️ Couldn't select {pick}.")
-        return pick
+        pick = options[int(chosen[1:])]
+        break
+
+    # Now select it on the page: open dropdown, type the name, click the row.
+    try:
+        results = await flow.search_and_pick(opener_key, pick, tag=tag)
+        # click exact match if present, else the first result
+        target = pick if pick in results else (results[0] if results else None)
+        if target:
+            await flow.pick_result(target, tag=tag)
+        elif not optional:
+            await bot.send_message(chat_id,
+                f"⚠️ Typed '{pick}' but saw no match on the page — continuing.")
+    except PublishError:
+        if not optional:
+            await bot.send_message(chat_id, f"⚠️ Couldn't select {pick} on the page.")
+    return pick
 
 
 async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
@@ -944,14 +974,15 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         is_owner = False          # default: agent (Mən vasitəçiyəm)
         await flow.choose_owner(is_owner)
 
-        # City — show buttons directly (no typing), paged 5 at a time.
+        # City — buttons from the known list; typed onto the page to select.
         city = await _pick_list(bot, chat_id, flow, "city_button", "City (Şəhər)",
-                                tag="city")
+                                tag="city", known=CITIES)
 
-        # Rayon (district) exists ONLY for Bakı; shown the same way as cities.
+        # Rayon (district): ONLY for Bakı, and it shows DISTRICT names, not cities.
         if (city or "").strip().lower() in ("bakı", "baki", "baku"):
             await _pick_list(bot, chat_id, flow, "district_button",
-                             "District (Rayon)", tag="district", optional=True)
+                             "District (Rayon)", tag="district",
+                             known=BAKU_DISTRICTS, optional=True)
             await _pick_list(bot, chat_id, flow, "village_button",
                              "Settlement (Qəsəbə)", tag="village", optional=True)
 
