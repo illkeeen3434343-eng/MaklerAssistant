@@ -45,7 +45,7 @@ SELECTORS = {
     "phone_choice": "text=Telefon nömrəsi",
     "phone_input": "#phone-field, input[type='tel'], input[name*='phone'], input[name*='number']",
     "phone_submit": "button:has-text('SMS-kod')",
-    "otp_input": "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code'], input[inputmode='numeric']",
+    "otp_input": "input[name*='code'], input[name*='otp'], input[autocomplete='one-time-code'], input[inputmode='numeric']:not([data-cy='phone-input']), input[type='tel']:not([data-cy='phone-input']), input.masked-input-field",
     "otp_submit": "button[type='submit'], button:has-text('Təsdiq'), button:has-text('Daxil')",
     "otp_error": ".error, .invalid-feedback, [role='alert']",
     "logged_in": "a[href*='/profile'], a[href*='/items/my'], a[href*='logout']",
@@ -240,7 +240,7 @@ class BinaSession:
         await self._pause()
         return await self._visible(SELECTORS["phone_input"], timeout=6000)
 
-    async def _type_phone(self) -> None:
+    async def _type_phone(self) -> bool:
         field = self._page.locator(SELECTORS["phone_input"]).first
         await field.wait_for(state="visible", timeout=15000)
         await field.click()
@@ -274,10 +274,32 @@ class BinaSession:
             await field.press("Enter")
         await self._page.wait_for_load_state("networkidle")
         await self._pause()
+        # Wait for the OTP field to actually appear before we ask the user.
+        return await self._wait_for_otp_field()
+
+    async def _wait_for_otp_field(self, timeout: float = 20.0) -> bool:
+        """Poll for the SMS-code input to render after the phone is submitted."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                f = self._page.locator(SELECTORS["otp_input"]).first
+                if await f.count() and await f.is_visible():
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        await self.snapshot("otp-field-missing")
+        return False
 
     async def _submit_otp(self, code: str) -> None:
         field = self._page.locator(SELECTORS["otp_input"]).first
-        await field.wait_for(state="visible", timeout=15000)
+        try:
+            await field.wait_for(state="visible", timeout=8000)
+        except Exception:
+            await self.snapshot("otp-field-missing")
+            raise LoginError(
+                "The SMS-code field didn't appear. Run /debug and send me "
+                "otp-field-missing.html so I can fix the selector.")
         await field.click()
         await field.fill("")
         await field.type(code, delay=110)
@@ -310,21 +332,25 @@ class BinaSession:
             await self.snapshot("no-auth-form")
             raise LoginError("Could not reach the phone form on hello.bina.az.")
 
-        await self._type_phone()
+        otp_ready = await self._type_phone()
+        if not otp_ready:
+            raise LoginError(
+                "Entered the phone number but the SMS-code field never appeared. "
+                "Run /debug and send me otp-field-missing.html.")
 
         error: str | None = None
         for attempt in range(1, OTP_MAX_ATTEMPTS + 1):
             code = re.sub(r"\D", "", await otp_provider(self.phone, attempt, error))
             if not code:
-                error = "That wasn't a code — digits only."
+                error = "Yalnız rəqəm göndərin."
                 continue
             try:
                 await self._submit_otp(code)
             except OtpRejected as exc:
-                error = f"bina.az rejected the code ({exc})."
+                error = f"bina.az kodu qəbul etmədi ({exc})."
                 continue
             if await self.is_logged_in():
                 await self._save()
                 return True
-            error = "Code accepted but session still logged out."
-        raise LoginError(f"Login failed after {OTP_MAX_ATTEMPTS} attempts.")
+            error = "Kod qəbul edildi, amma giriş tamamlanmadı."
+        raise LoginError(f"Giriş {OTP_MAX_ATTEMPTS} cəhddən sonra alınmadı.")

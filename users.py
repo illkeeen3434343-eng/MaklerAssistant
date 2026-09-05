@@ -61,15 +61,42 @@ def _save(data: dict) -> None:
 
 
 # ------------------------------------------------------------------ users
-def ensure_user(user_id: int, default_status: str = "pending") -> dict:
-    """Return the user record, creating a pending one on first sight."""
+def ensure_user(user_id: int, default_status: str = "pending",
+                username: str = "", name: str = "") -> dict:
+    """Return the user record, creating a pending one on first sight.
+
+    username/name are refreshed each time we see the user so the admin panel
+    and reports always show current values.
+    """
     data = _load()
     uid = str(user_id)
     if uid not in data:
         data[uid] = {"status": default_status, "tier": "free",
-                     "numbers": [], "note": "", "created_at": _now()}
+                     "numbers": [], "note": "", "created_at": _now(),
+                     "username": username, "name": name}
         _save(data)
+    else:
+        changed = False
+        if username and data[uid].get("username") != username:
+            data[uid]["username"] = username; changed = True
+        if name and data[uid].get("name") != name:
+            data[uid]["name"] = name; changed = True
+        if changed:
+            _save(data)
     return data[uid]
+
+
+def label_for(user_id: int) -> str:
+    """A clickable '/id @username (Name)' label for admin lists."""
+    u = _load().get(str(user_id)) or {}
+    un = u.get("username")
+    nm = u.get("name")
+    parts = [f"/{user_id}"]
+    if un:
+        parts.append(f"@{un}")
+    if nm:
+        parts.append(f"({nm})")
+    return " ".join(parts)
 
 
 def get_user(user_id: int) -> dict | None:

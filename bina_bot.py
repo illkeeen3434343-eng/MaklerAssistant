@@ -206,22 +206,24 @@ dp = Dispatcher(storage=MemoryStorage())
 async def start(msg: Message, state: FSMContext):
     await state.clear()
     uid = msg.from_user.id
-    # Register the user (pending by default). Admins are auto-active.
-    U.ensure_user(uid, default_status="active" if uid in ADMIN_IDS else "pending")
+    uname = msg.from_user.username or ""
+    fname = msg.from_user.full_name or ""
+    U.ensure_user(uid, default_status="active" if uid in ADMIN_IDS else "pending",
+                  username=uname, name=fname)
     if uid in ADMIN_IDS and not U.is_active(uid):
         U.set_status(uid, "active")
-    who = mask(BINA_PHONE) if BINA_PHONE else "not set"
     rec = U.get_user(uid) or {}
+    tier_az = {"free": "Pulsuz", "pro": "Pro", "diamond": "Diamond"}.get(rec.get("tier","free"), rec.get("tier"))
+    status_az = {"active": "Aktiv", "pending": "Gözləmədə", "blocked": "Bloklanıb"}.get(rec.get("status","?"), rec.get("status"))
     extra = ""
     if uid in ADMIN_IDS:
-        extra = "\n\n🛠 You are an <b>admin</b> — use the Admin button."
+        extra = "\n\n🛠 Siz <b>adminsiniz</b> — Admin düyməsindən istifadə edin."
     elif rec.get("status") != "active":
-        extra = ("\n\n⏳ Your account is <b>pending</b> approval. An admin must "
-                 "activate you before you can use the bot.")
+        extra = ("\n\n⏳ Hesabınız <b>təsdiq gözləyir</b>. Admin sizi aktivləşdirənə "
+                 "qədər botdan istifadə edə bilməzsiniz.")
     await msg.answer(
         "👋 <b>MaklerAssistant</b>\n\n"
-        f"Configured number: <b>{who}</b>\n"
-        f"Status: <b>{rec.get('status','?')}</b> · Tier: <b>{rec.get('tier','free')}</b>"
+        f"Status: <b>{status_az}</b> · Tarif: <b>{tier_az}</b>"
         + extra,
         reply_markup=main_menu(uid),
     )
@@ -344,42 +346,65 @@ async def kb_login(msg: Message, state: FSMContext, bot: Bot):
 async def kb_contact(msg: Message, state: FSMContext):
     await state.set_state(Flow.report)
     await msg.answer(
-        "✉️ <b>Contact / Report an issue</b>\n\n"
-        "Describe your problem or request in one message and I'll pass it to "
-        "the admin. (e.g. \"Please move my number 0557778899 to another "
-        "account\" or a bug you hit.)\n\n"
-        "<i>Send /cancel to stop.</i>")
+        "✉️ <b>Əlaqə / Problem bildir</b>\n\n"
+        "Problemi və ya sorğunu bir mesajda yazın — admində çatdıracam. "
+        "İstəsəniz <b>şəkil də göndərə bilərsiniz</b>.\n\n"
+        "<i>Dayandırmaq üçün /cancel.</i>")
+
+
+async def _forward_report_to_admins(bot, msg, caption_text):
+    uid = msg.from_user.id
+    label = U.label_for(uid)
+    tier = U.tier_of(uid)
+    status = (U.get_user(uid) or {}).get("status", "?")
+    header = (f"📩 <b>Yeni müraciət</b>\n"
+              f"Kimdən: {label}\n"
+              f"Tarif: {tier} · Status: {status}")
+    forwarded = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            if msg.photo:
+                # forward the photo with the report text as caption
+                await bot.send_photo(admin_id, msg.photo[-1].file_id,
+                                     caption=f"{header}\n\n{caption_text}"[:1024])
+            else:
+                await bot.send_message(admin_id, f"{header}\n\n{caption_text}")
+            forwarded += 1
+        except Exception:
+            pass
+    return forwarded
+
+
+@dp.message(Flow.report, F.photo)
+async def got_report_photo(msg: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    uid = msg.from_user.id
+    if not ADMIN_IDS:
+        await msg.answer("⚠️ Admin təyin olunmayıb.", reply_markup=main_menu(uid))
+        return
+    text = (msg.caption or "").strip() or "(şəkil, mətn yoxdur)"
+    n = await _forward_report_to_admins(bot, msg, text)
+    await msg.answer(
+        "✅ Adminə göndərildi. Tezliklə cavab veriləcək." if n else
+        "⚠️ Admin əlçatan deyil — sonra yenidən cəhd edin.",
+        reply_markup=main_menu(uid))
 
 
 @dp.message(Flow.report)
 async def got_report(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
     text = (msg.text or "").strip()
-    if not text or text.lower() in ("/cancel", "/stop"):
-        await msg.answer("Cancelled.", reply_markup=main_menu(msg.from_user.id))
-        return
     uid = msg.from_user.id
-    uname = f"@{msg.from_user.username}" if msg.from_user.username else "(no username)"
-    if not ADMIN_IDS:
-        await msg.answer("⚠️ No admin is configured to receive reports.",
-                         reply_markup=main_menu(uid))
+    if not text or text.lower() in ("/cancel", "/stop"):
+        await msg.answer("Ləğv edildi.", reply_markup=main_menu(uid))
         return
-    forwarded = 0
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"📩 <b>New report</b>\n"
-                f"From: <code>{uid}</code> {uname}\n"
-                f"Tier: {U.tier_of(uid)} · Status: "
-                f"{(U.get_user(uid) or {}).get('status','?')}\n\n"
-                f"{text}")
-            forwarded += 1
-        except Exception:
-            pass
+    if not ADMIN_IDS:
+        await msg.answer("⚠️ Admin təyin olunmayıb.", reply_markup=main_menu(uid))
+        return
+    n = await _forward_report_to_admins(bot, msg, text)
     await msg.answer(
-        "✅ Sent to the admin. They'll get back to you." if forwarded else
-        "⚠️ Couldn't reach the admin right now — please try again later.",
+        "✅ Adminə göndərildi. Tezliklə cavab veriləcək." if n else
+        "⚠️ Admin əlçatan deyil — sonra yenidən cəhd edin.",
         reply_markup=main_menu(uid))
 # ==================== END CONTACT / REPORT ====================
 
@@ -518,25 +543,30 @@ async def kb_admin(msg: Message):
 
 @dp.message(F.text == BTN_A_BACK)
 async def kb_admin_back(msg: Message):
-    # #7: Back -> main buttons return
-    await msg.answer("Back to the main menu.", reply_markup=main_menu(msg.from_user.id))
+    await msg.answer("Əsas menyuya qayıdıldı.", reply_markup=main_menu(msg.from_user.id))
+
+
+def _user_line(uid_str, r):
+    """One clickable line: '/id @username (Name) — status / tier / N num'."""
+    label = U.label_for(int(uid_str))
+    star = " 🛠" if int(uid_str) in ADMIN_IDS else ""
+    return (f"{label}{star}\n   {r.get('status')} · {r.get('tier')} · "
+            f"{len(r.get('numbers', []))} nömrə")
 
 
 @dp.message(F.text == BTN_A_PENDING)
 async def kb_admin_pending(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
-    data = U.all_users()
-    pend = {u: r for u, r in data.items() if r.get("status") == "pending"}
+    pend = {u: r for u, r in U.all_users().items() if r.get("status") == "pending"}
     if not pend:
-        await msg.answer("No pending users.", reply_markup=admin_menu())
+        await msg.answer("Gözləyən istifadəçi yoxdur.", reply_markup=admin_menu())
         return
-    lines = ["<b>Pending users</b>", ""]
+    lines = ["⏳ <b>Gözləyən istifadəçilər</b>",
+             "Statusu dəyişmək üçün ID-yə toxunun:", ""]
     for u, r in pend.items():
-        lines.append(f"• <code>{u}</code> — tier {r.get('tier')}, "
-                     f"{len(r.get('numbers', []))} number(s)")
-    lines.append("\nUse <b>Set status</b> to activate them.")
-    await msg.answer("\n".join(lines), reply_markup=admin_menu())
+        lines.append(_user_line(u, r))
+    await msg.answer("\n".join(lines)[:3800], reply_markup=admin_menu())
 
 
 @dp.message(F.text == BTN_A_USERS)
@@ -545,83 +575,70 @@ async def kb_admin_users(msg: Message):
         return
     data = U.all_users()
     if not data:
-        await msg.answer("No users yet.", reply_markup=admin_menu())
+        await msg.answer("Hələ istifadəçi yoxdur.", reply_markup=admin_menu())
         return
-    lines = ["<b>All users</b>", ""]
+    lines = ["👥 <b>Bütün istifadəçilər</b>",
+             "İdarə etmək üçün ID-yə toxunun:", ""]
     for u, r in data.items():
-        star = " 🛠" if int(u) in ADMIN_IDS else ""
-        lines.append(f"• <code>{u}</code>{star} — {r.get('status')} / "
-                     f"{r.get('tier')} / {len(r.get('numbers', []))} num")
+        lines.append(_user_line(u, r))
     await msg.answer("\n".join(lines)[:3800], reply_markup=admin_menu())
 
 
 @dp.message(F.text == BTN_A_SETSTATUS)
-async def kb_admin_setstatus(msg: Message, bot: Bot):
+async def kb_admin_setstatus(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
-    chat_id = msg.chat.id
-    if lock_for(chat_id).locked():
-        await msg.answer("⏳ Busy — finish the current action first.")
-        return
-    async with lock_for(chat_id):
-        try:
-            target = await ask.ask_text(bot, chat_id,
-                "Send the <b>Telegram user id</b> to change status for:")
-            target = target.strip()
-            if not target.isdigit():
-                await bot.send_message(chat_id, "That's not a numeric id.", reply_markup=admin_menu())
-                return
-            status = await ask.ask_choice(bot, chat_id,
-                f"New status for <code>{target}</code>?",
-                [("✅ active", "active"), ("⏳ pending", "pending"), ("🚫 blocked", "blocked")])
-            U.ensure_user(int(target))
-            U.set_status(int(target), status)
-            await bot.send_message(chat_id, f"✅ User <code>{target}</code> → {status}.",
-                                   reply_markup=admin_menu())
-            # notify the user
-            try:
-                await bot.send_message(int(target),
-                    f"ℹ️ An admin set your status to <b>{status}</b>.")
-            except Exception:
-                pass
-        except Cancelled:
-            await bot.send_message(chat_id, "Cancelled.", reply_markup=admin_menu())
-        except asyncio.TimeoutError:
-            await bot.send_message(chat_id, "⏰ Timed out.", reply_markup=admin_menu())
+    await kb_admin_users(msg)   # show the clickable list; tapping an ID opens actions
 
 
 @dp.message(F.text == BTN_A_SETTIER)
-async def kb_admin_settier(msg: Message, bot: Bot):
+async def kb_admin_settier(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
+    await kb_admin_users(msg)
+
+
+# Tapping a "/123456" line opens an action menu for that user (admin only).
+@dp.message(F.text.regexp(r"^/\d{4,}$"))
+async def admin_pick_user(msg: Message, bot: Bot):
+    if not _is_admin(msg.from_user.id):
+        return
+    target = int(msg.text.strip().lstrip("/"))
     chat_id = msg.chat.id
     if lock_for(chat_id).locked():
-        await msg.answer("⏳ Busy — finish the current action first.")
+        await msg.answer("⏳ Məşğul — əvvəlki əməliyyatı bitirin.")
         return
     async with lock_for(chat_id):
         try:
-            target = await ask.ask_text(bot, chat_id,
-                "Send the <b>Telegram user id</b> to change tier for:")
-            target = target.strip()
-            if not target.isdigit():
-                await bot.send_message(chat_id, "That's not a numeric id.", reply_markup=admin_menu())
-                return
-            tier = await ask.ask_choice(bot, chat_id,
-                f"New tier for <code>{target}</code>?",
-                [("Free (1 num)", "free"), ("Pro (2 num)", "pro"), ("Diamond (5 num)", "diamond")])
-            U.ensure_user(int(target))
-            U.set_tier(int(target), tier)
-            await bot.send_message(chat_id, f"⭐ User <code>{target}</code> → {tier}.",
-                                   reply_markup=admin_menu())
-            try:
-                await bot.send_message(int(target),
-                    f"⭐ An admin upgraded your tier to <b>{tier}</b>.")
-            except Exception:
-                pass
+            U.ensure_user(target)
+            action = await ask.ask_choice(bot, chat_id,
+                f"{U.label_for(target)} — nə edək?",
+                [("✅ Aktiv et", "st:active"), ("⏳ Gözləmə", "st:pending"),
+                 ("🚫 Blokla", "st:blocked"),
+                 ("⭐ Tarif: Pulsuz", "ti:free"), ("⭐ Tarif: Pro", "ti:pro"),
+                 ("⭐ Tarif: Diamond", "ti:diamond")])
+            kind, val = action.split(":")
+            if kind == "st":
+                U.set_status(target, val)
+                az = {"active":"Aktiv","pending":"Gözləmədə","blocked":"Bloklandı"}[val]
+                await bot.send_message(chat_id, f"✅ {U.label_for(target)} → {az}",
+                                       reply_markup=admin_menu())
+                try:
+                    await bot.send_message(target, f"ℹ️ Admin statusunuzu dəyişdi: <b>{az}</b>.")
+                except Exception:
+                    pass
+            else:
+                U.set_tier(target, val)
+                await bot.send_message(chat_id, f"⭐ {U.label_for(target)} → {val}",
+                                       reply_markup=admin_menu())
+                try:
+                    await bot.send_message(target, f"⭐ Tarifiniz dəyişdirildi: <b>{val}</b>.")
+                except Exception:
+                    pass
         except Cancelled:
-            await bot.send_message(chat_id, "Cancelled.", reply_markup=admin_menu())
+            await bot.send_message(chat_id, "Ləğv edildi.", reply_markup=admin_menu())
         except asyncio.TimeoutError:
-            await bot.send_message(chat_id, "⏰ Timed out.", reply_markup=admin_menu())
+            await bot.send_message(chat_id, "⏰ Vaxt bitdi.", reply_markup=admin_menu())
 # ==================== END ADMIN PANEL ====================
 
 
@@ -1077,8 +1094,8 @@ async def _otp_provider(bot: Bot, chat_id: int, state: FSMContext):
         lines = []
         if error:
             lines.append(f"⚠️ {error}")
-        lines.append(f"📲 bina.az texted a code to <b>{mask(phone)}</b>")
-        lines.append(f"Send it here (attempt {attempt}/{bina_core.OTP_MAX_ATTEMPTS}). /cancel to stop.")
+        lines.append(f"📲 bina.az <b>{mask(phone)}</b> nömrəsinə SMS kod göndərdi.")
+        lines.append("Kodu bura göndərin. Dayandırmaq üçün /cancel.")
         await bot.send_message(chat_id, "\n".join(lines))
         await state.set_state(Flow.ask_otp)
         loop = asyncio.get_running_loop()
