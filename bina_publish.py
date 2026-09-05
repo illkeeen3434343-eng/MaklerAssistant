@@ -224,19 +224,24 @@ class PublishFlow:
         except Exception:
             pass
 
-    async def search_and_pick(self, opener_key: str, query: str, tag: str) -> list[str]:
-        """Open a search-dropdown, type `query`, return the visible result texts.
+    # bina.az city/district/village options are radio rows:
+    #   <label data-cy="radio-container">
+    #     <input type="radio" name="search-city" data-cy="city-1" value="1">
+    #     <span data-cy="city">Bakı</span>
+    #   </label>
+    OPTION_ROW = "label[data-cy='radio-container']"
+    OPTION_TEXT = "[data-cy='city']"          # the label text span (same for all 3)
 
-        These bina.az fields (city, district, village) each contain a
-        data-cy='search-input'. Typing filters the list; we then read the
-        results so the caller can show them as buttons and pick one.
+    async def search_and_pick(self, opener_key: str, query: str, tag: str) -> list[str]:
+        """Open a search-dropdown, type `query`, return the option label texts.
+
+        Reads the radio-row labels (span[data-cy='city']) rather than guessing
+        at <li> elements — that's the real markup for city/district/village.
         """
         await self._close_overlay()
         await self._click(PUB[opener_key], f"open-{tag}")
         await asyncio.sleep(0.8)
 
-        # find the search box that just became active and type into it
-        typed = False
         try:
             box = self.page.locator(PUB["search_input"]).last
             await box.wait_for(state="visible", timeout=4000)
@@ -244,25 +249,53 @@ class PublishFlow:
             await box.fill("")
             if query:
                 await box.type(query, delay=60)
-                typed = True
             await asyncio.sleep(1.0)
         except Exception:
             pass
 
-        before_skip = set(self._NON_OPTIONS)
-        results = []
+        results: list[str] = []
         for _ in range(10):
             await asyncio.sleep(0.4)
-            results = [t for t in await self._scan_option_texts()
-                       if t not in before_skip]
+            results = await self.page.evaluate(
+                """(sel) => Array.from(document.querySelectorAll(sel))
+                       .filter(el => el.getClientRects().length)
+                       .map(el => (el.textContent || '').trim())
+                       .filter(Boolean)""",
+                self.OPTION_TEXT,
+            )
             if results:
                 break
         await self.s.snapshot(f"publish-{tag}-open")
         return results
 
     async def pick_result(self, text: str, tag: str):
-        await self._click_text(text, tag)
-        await asyncio.sleep(1.0)
+        """Click the radio row whose text span == `text`."""
+        clicked = await self.page.evaluate(
+            """({rowSel, txtSel, want}) => {
+                for (const row of document.querySelectorAll(rowSel)) {
+                    const t = row.querySelector(txtSel);
+                    if (t && t.textContent.trim() === want) {
+                        (t || row).click();          // click the text
+                        const radio = row.querySelector("input[type='radio']");
+                        if (radio) radio.click();     // and the radio, to be safe
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            {"rowSel": self.OPTION_ROW, "txtSel": self.OPTION_TEXT, "want": text},
+        )
+        if not clicked:
+            # fallback: plain text click
+            try:
+                await self.page.get_by_text(text, exact=True).first.click(timeout=4000)
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            await self.s.snapshot(f"publish-pick-{tag}")
+            raise PublishError(f"Couldn't click '{text}' in the {tag} list.")
+        await asyncio.sleep(1.2)
 
     async def open_map_and_confirm(self):
         """Click 'Xəritədə göstər' and confirm the map popup (#4).
