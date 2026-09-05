@@ -187,6 +187,16 @@ class PublishFlow:
         low = self.page.url.lower()
         if "login" in low or "hello.bina.az" in low or "authentication" in low:
             raise PublishError("Not logged in — profile redirected to login.")
+        # Even without a redirect, a visible 'Giriş' header button (and no
+        # profile avatar) means we're logged out — don't report "no ads".
+        try:
+            giris = self.page.locator("button[data-cy='header-profile-btn']:has-text('Giriş')").first
+            if await giris.count() and await giris.is_visible(timeout=1500):
+                raise PublishError("Not logged in — please log in first.")
+        except PublishError:
+            raise
+        except Exception:
+            pass
 
         scrape_js = """() => {
             const out = [];

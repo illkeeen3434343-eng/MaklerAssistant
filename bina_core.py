@@ -50,15 +50,20 @@ SELECTORS = {
     # The code page has NO submit button (only 'resend'); it auto-submits, so
     # otp_submit is intentionally empty and we rely on typing + Enter.
     "otp_submit": "",
-    "otp_submit": "button[type='submit'], button:has-text('Təsdiq'), button:has-text('Daxil')",
     "otp_error": ".error, .invalid-feedback, [role='alert']",
     "logged_in": "a[href*='/profile'], a[href*='/items/my'], a[href*='logout']",
 }
 
 LOGIN_TRIGGERS = [SELECTORS["login_trigger"], "[data-stat='header-profile-btn']",
                   "button:has-text('Giriş')", "text=Giriş"]
-PHONE_CHOICES = [SELECTORS["phone_choice"], "button:has-text('Telefon nömrəsi')",
-                 "a:has-text('Telefon nömrəsi')", "text=Telefon nömrəsi ilə giriş"]
+PHONE_CHOICES = [
+    "a[data-stat='auth-by-phone']",           # the real modal link (homepage HTML)
+    "a[data-cy='auth-btn-default']",
+    SELECTORS["phone_choice"],
+    "a:has-text('Telefon nömrəsi')",
+    "button:has-text('Telefon nömrəsi')",
+    "text=Telefon nömrəsi ilə giriş",
+]
 SUBMIT_BUTTONS = ["button:has-text('SMS-kod')", "button[type='submit']",
                   "input[type='submit']", "button:has-text('Davam')",
                   "button:has-text('Daxil ol')", "button:has-text('Təsdiq')",
@@ -235,12 +240,46 @@ class BinaSession:
         return False
 
     async def _open_auth(self) -> bool:
-        await self._page.goto(AUTH_URL, wait_until="domcontentloaded")
+        """Reach the phone-entry field the way a human does:
+        homepage -> click 'Giriş' -> click 'Telefon nömrəsi ilə giriş'.
+
+        Going straight to hello.bina.az can bounce back to the homepage, so we
+        drive it through the header button and the auth modal instead.
+        """
+        # 1) homepage
+        await self._page.goto(HOME_URL, wait_until="domcontentloaded")
         await self._page.wait_for_load_state("networkidle")
         await self._pause()
+
+        # If a phone field is already visible (rare), done.
         if await self._visible(SELECTORS["phone_input"]):
             return True
+
+        # 2) click the header 'Giriş' button to open the auth modal
+        await self._click_first(LOGIN_TRIGGERS)
+        await self._pause()
+
+        # 3) click 'Telefon nömrəsi ilə giriş' (opens hello.bina.az phone page)
         await self._click_first(PHONE_CHOICES)
+        await asyncio.sleep(2.0)
+        await self._page.wait_for_load_state("networkidle")
+
+        # 4) the phone page may open as a new tab/window — switch to it
+        try:
+            for pg in list(self._ctx.pages):
+                if "hello.bina.az" in (pg.url or "").lower():
+                    self._page = pg
+                    await self._page.bring_to_front()
+                    break
+        except Exception:
+            pass
+
+        if await self._visible(SELECTORS["phone_input"], timeout=6000):
+            return True
+
+        # 5) fallback: navigate to the auth URL directly
+        await self._page.goto(AUTH_URL, wait_until="domcontentloaded")
+        await self._page.wait_for_load_state("networkidle")
         await self._pause()
         return await self._visible(SELECTORS["phone_input"], timeout=6000)
 
