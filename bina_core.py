@@ -142,6 +142,10 @@ class BinaSession:
             locale="az-AZ", timezone_id="Asia/Baku",
             viewport={"width": 1366, "height": 900},
         )
+        # Never let a single action hang on Playwright's 30s default — the
+        # auth pages navigate away mid-action, and a 30s stall looks like a
+        # crash to the user.
+        self._ctx.set_default_timeout(15000)
         self._page = await self._ctx.new_page()
 
     @property
@@ -196,7 +200,7 @@ class BinaSession:
             try:
                 loc = self._page.locator(sel).first
                 if await loc.count() and await loc.is_visible(timeout=timeout):
-                    await loc.click()
+                    await loc.click(timeout=timeout)
                     return True
             except Exception:
                 continue
@@ -394,17 +398,41 @@ class BinaSession:
                 "SMS kod xanası tapılmadı. /debug yazıb otp-field-missing.html "
                 "faylını göndərin ki, seçicini düzəldim.")
         await field.click()
-        await field.fill("")
-        await field.type(code, delay=110)
-        await asyncio.sleep(0.6)
-        # The code page has no submit button (only 'resend'), and clicking any
-        # 'SMS-kod' button would RESEND the code. So submit with Enter only,
-        # unless an explicit otp_submit selector is configured.
-        if SELECTORS.get("otp_submit"):
-            await self._click_first([SELECTORS["otp_submit"]])
-        else:
-            await field.press("Enter")
-        await self._page.wait_for_load_state("networkidle")
+        try:
+            await field.fill("")
+        except Exception:
+            pass
+        # Type the code. IMPORTANT: bina.az AUTO-SUBMITS as soon as the last
+        # digit lands — the field then disappears and login completes. So we
+        # must not assume the element still exists after typing.
+        try:
+            await field.type(code, delay=110)
+        except Exception:
+            pass                      # it may vanish mid-typing; that's fine
+        await asyncio.sleep(1.2)
+
+        # Did the page already move on (auto-submit succeeded)?
+        gone = False
+        try:
+            gone = (await field.count()) == 0 or not await field.is_visible(timeout=1000)
+        except Exception:
+            gone = True
+
+        if not gone:
+            # Still waiting for us -> submit explicitly, with a SHORT timeout so
+            # we never hang for the 30s default.
+            try:
+                if SELECTORS.get("otp_submit"):
+                    await self._click_first([SELECTORS["otp_submit"]], timeout=3000)
+                else:
+                    await field.press("Enter", timeout=5000)
+            except Exception:
+                pass                  # auto-submit may have fired meanwhile
+
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
         await self._pause()
         # rejected?
         try:
