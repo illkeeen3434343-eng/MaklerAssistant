@@ -50,7 +50,11 @@ SELECTORS = {
     # The code page has NO submit button (only 'resend'); it auto-submits, so
     # otp_submit is intentionally empty and we rely on typing + Enter.
     "otp_submit": "",
-    "otp_error": ".error, .invalid-feedback, [role='alert']",
+    # NOTE: bina.az is a Next.js app and renders an EMPTY screen-reader element
+    # <p id="__next-route-announcer__" role="alert"> on every page. A bare
+    # [role='alert'] match therefore looked like an OTP rejection on success.
+    "otp_error": ".error, .invalid-feedback, .message--error, "
+                 "[role='alert']:not(#__next-route-announcer__):not([aria-live])",
     "logged_in": "a[href*='/profile'], a[href*='/items/my'], a[href*='logout']",
 }
 
@@ -434,11 +438,21 @@ class BinaSession:
         except Exception:
             pass
         await self._pause()
-        # rejected?
+
+        # SUCCESS BEATS ERROR-DETECTION. If we've left the auth service, the
+        # code was accepted — do not go looking for "errors" on the logged-in
+        # page (Next.js renders an empty role=alert announcer everywhere).
+        url = (self._page.url or "").lower()
+        if "hello.bina.az" not in url and "authentication" not in url:
+            return
+
+        # Rejected? Only count it if there is REAL, non-empty error text.
         try:
             err = self._page.locator(SELECTORS["otp_error"]).first
-            if await err.is_visible(timeout=2000):
-                raise OtpRejected((await err.inner_text())[:150])
+            if await err.count() and await err.is_visible(timeout=2000):
+                text = ((await err.inner_text()) or "").strip()
+                if text:
+                    raise OtpRejected(text[:150])
         except OtpRejected:
             raise
         except Exception:
