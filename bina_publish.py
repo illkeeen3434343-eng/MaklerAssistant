@@ -190,7 +190,10 @@ class PublishFlow:
         # Even without a redirect, a visible 'Giriş' header button (and no
         # profile avatar) means we're logged out — don't report "no ads".
         try:
-            giris = self.page.locator("button[data-cy='header-profile-btn']:has-text('Giriş')").first
+            # The 'Giriş' button exists ONLY when logged out (when logged in it
+            # is replaced by an avatar div with no data-cy). Presence alone is
+            # the signal — don't match on text.
+            giris = self.page.locator("button[data-cy='header-profile-btn']").first
             if await giris.count() and await giris.is_visible(timeout=1500):
                 raise PublishError("Not logged in — please log in first.")
         except PublishError:

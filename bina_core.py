@@ -55,6 +55,10 @@ SELECTORS = {
     # [role='alert'] match therefore looked like an OTP rejection on success.
     "otp_error": ".error, .invalid-feedback, .message--error, "
                  "[role='alert']:not(#__next-route-announcer__):not([aria-live])",
+    # NOTE: kept for reference only — NOT used for login detection. On the
+    # logged-in homepage bina.az renders NO /profile, /items/my or logout link
+    # (the profile control is an avatar <div role="button"> with no href), so
+    # these are unreliable. See is_logged_in() for the correct signal.
     "logged_in": "a[href*='/profile'], a[href*='/items/my'], a[href*='logout']",
 }
 
@@ -222,11 +226,18 @@ class BinaSession:
 
     # ---- auth ----
     async def is_logged_in(self) -> bool:
-        """True if logged in. Uses the homepage header as the reliable signal:
-        logged-out shows the 'Giriş' button; logged-in shows the profile menu.
+        """Logged-out IFF the header shows the 'Giriş' button.
 
-        This avoids depending on /profile/items (which can briefly 404 or race
-        the post-login redirect) for the yes/no decision.
+        Verified against real page snapshots:
+          logged OUT -> <button data-cy="header-profile-btn">Giriş</button>
+          logged IN  -> that button is ABSENT; it is replaced by an avatar
+                        dropdown (<div role="button">) that has NO data-cy and
+                        NO href, and the homepage contains no /profile,
+                        /items/my or logout link.
+
+        So absence-of-Giriş is the only reliable positive signal. We guard it
+        with a "did the header actually render?" check so a blank/failed page
+        is never mistaken for a logged-in one.
         """
         try:
             await self._page.goto(HOME_URL, wait_until="domcontentloaded")
@@ -235,28 +246,27 @@ class BinaSession:
             pass
         await asyncio.sleep(1.0)
 
-        # Logged OUT if the header 'Giriş' button is present.
+        # 1) Did the page/header actually render? ('Yeni elan' is always there)
         try:
-            giris = self._page.locator(
-                "button[data-cy='header-profile-btn']").first
-            if await giris.count():
-                txt = ((await giris.inner_text()) or "").strip().lower()
-                # The same data-cy is the profile button when logged in, but
-                # then it does NOT read 'Giriş'.
-                if "giriş" in txt or "giris" in txt:
-                    return False
-                return True   # button exists but isn't 'Giriş' -> logged in
+            rendered = await self._page.locator(
+                "a[data-cy='header-add-new-item-btn'], header#header, header"
+            ).count()
         except Exception:
-            pass
+            rendered = 0
+        if not rendered:
+            _log("login check: header did not render -> treating as logged out")
+            return False
 
-        # Fallback: a profile/logout link means logged in.
+        # 2) 'Giriş' button present => logged OUT.
         try:
-            marker = self._page.locator(SELECTORS["logged_in"]).first
-            if await marker.count():
-                return True
+            if await self._page.locator(
+                    "button[data-cy='header-profile-btn']").count():
+                return False
         except Exception:
-            pass
-        return False
+            return False
+
+        # 3) Header rendered and no 'Giriş' button => logged IN.
+        return True
 
     async def _open_auth(self) -> bool:
         """Reach the phone-entry field the way a human does:
