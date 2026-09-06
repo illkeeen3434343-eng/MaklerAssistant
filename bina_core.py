@@ -29,7 +29,7 @@ RETURN_TO = os.getenv("RETURN_TO", "https://bina.az/").strip() or "https://bina.
 _RT_B64 = base64.urlsafe_b64encode(RETURN_TO.encode()).decode().rstrip("=")
 HOME_URL = os.getenv("HOME_URL", "https://bina.az/").strip()
 AUTH_URL = os.getenv("AUTH_URL", f"https://hello.bina.az/?return_to={_RT_B64}").strip()
-MY_ITEMS_URL = os.getenv("MY_ITEMS_URL", "https://bina.az/items/my").strip()
+MY_ITEMS_URL = os.getenv("MY_ITEMS_URL", "https://bina.az/profile/items").strip()
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "sessions"))
@@ -222,29 +222,40 @@ class BinaSession:
 
     # ---- auth ----
     async def is_logged_in(self) -> bool:
-        """True only if we're logged in AND as THIS session's phone number.
+        """True if logged in. Uses the homepage header as the reliable signal:
+        logged-out shows the 'Giriş' button; logged-in shows the profile menu.
 
-        Just checking that /items/my loads isn't enough — a leftover cookie
-        from a different number would pass and skip OTP for the new number.
-        We confirm the account's own phone (shown on the profile) matches.
+        This avoids depending on /profile/items (which can briefly 404 or race
+        the post-login redirect) for the yes/no decision.
         """
-        await self._page.goto(MY_ITEMS_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(1.5)
-        low = self._page.url.lower()
-        bounced = ("login" in low) or ("hello.bina.az" in low) or ("authentication" in low)
-        if bounced or "/items/my" not in low:
-            return False
-        # Verify identity: the profile shows the account's own phone number.
         try:
-            body = await self._page.evaluate("() => document.body.innerText || ''")
+            await self._page.goto(HOME_URL, wait_until="domcontentloaded")
+            await self._page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
-            body = ""
-        digits_here = re.sub(r"\D", "", body)
-        want = self.local[-7:]           # last 7 digits are enough to distinguish
-        if want and want in digits_here:
-            return True
-        # Couldn't confirm this phone → treat as NOT logged in (forces OTP).
-        _log(f"logged-in check: phone {mask(self.phone)} not confirmed on page")
+            pass
+        await asyncio.sleep(1.0)
+
+        # Logged OUT if the header 'Giriş' button is present.
+        try:
+            giris = self._page.locator(
+                "button[data-cy='header-profile-btn']").first
+            if await giris.count():
+                txt = ((await giris.inner_text()) or "").strip().lower()
+                # The same data-cy is the profile button when logged in, but
+                # then it does NOT read 'Giriş'.
+                if "giriş" in txt or "giris" in txt:
+                    return False
+                return True   # button exists but isn't 'Giriş' -> logged in
+        except Exception:
+            pass
+
+        # Fallback: a profile/logout link means logged in.
+        try:
+            marker = self._page.locator(SELECTORS["logged_in"]).first
+            if await marker.count():
+                return True
+        except Exception:
+            pass
         return False
 
     async def _open_auth(self) -> bool:
@@ -496,6 +507,8 @@ class BinaSession:
             except OtpRejected as exc:
                 error = f"bina.az kodu qəbul etmədi ({exc})."
                 continue
+            # Give the auth redirect a moment to land before verifying.
+            await asyncio.sleep(2.5)
             if await self.is_logged_in():
                 await self._save()
                 return True
