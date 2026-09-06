@@ -52,6 +52,10 @@ log = logging.getLogger("makler")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+# PUBLIC_MODE=true  -> anyone may /start; they register as 'pending' and an
+#                      admin approves them (the approval system you already have).
+# PUBLIC_MODE=false -> strict ALLOWED_USER_IDS whitelist (original behaviour).
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
 BINA_PHONE = os.getenv("BINA_PHONE", "").strip()
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "300"))
 
@@ -94,42 +98,99 @@ _last_user_id: dict[int, int] = {}   # chat_id -> user_id, filled by middleware
 
 
 class Whitelist(BaseMiddleware):
+    """Access gate.
+
+    PUBLIC_MODE=false -> strict ALLOWED_USER_IDS whitelist (private bot).
+    PUBLIC_MODE=true  -> anyone may /start. They are registered as 'pending'
+                         and must be approved by an admin (Admin -> Set status)
+                         before they can use any feature. 'blocked' users are
+                         refused outright.
+    """
+
+    # Things a not-yet-approved user is still allowed to do.
+    EXEMPT_TEXTS = {"/start", "/cancel", "/stop", "/help"}
+
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if user:
-            _current_uid.set(user.id)
-            _last_user_id[getattr(getattr(event, "chat", None), "id", user.id) or user.id] = user.id
-            if user.id not in ALLOWED:
-                if isinstance(event, Message):
-                    await event.answer("⛔️ Private bot.")
-                elif isinstance(event, CallbackQuery):
-                    await event.answer("⛔️ Private bot.", show_alert=True)
+        if not user:
+            return await handler(event, data)
+
+        uid = user.id
+        _current_uid.set(uid)
+        _last_user_id[getattr(getattr(event, "chat", None), "id", uid) or uid] = uid
+
+        # Admins always pass.
+        if uid in ADMIN_IDS:
+            return await handler(event, data)
+
+        if not PUBLIC_MODE:
+            if uid not in ALLOWED:
+                await self._deny(event,
+                    "⛔️ Bu bot şəxsidir. Giriş üçün admin ilə əlaqə saxlayın.")
                 return None
+            return await handler(event, data)
+
+        # ---- public mode ----
+        rec = U.ensure_user(uid, username=(user.username or ""),
+                            name=(user.full_name or ""))
+        status = rec.get("status", "pending")
+
+        if status == "blocked":
+            await self._deny(event, "⛔️ Hesabınız bloklanıb.")
+            return None
+
+        if status != "active":
+            text = (getattr(event, "text", "") or "").strip()
+            raw_state = data.get("raw_state")
+            in_report = raw_state == Flow.report.state
+            allowed_now = (
+                text in self.EXEMPT_TEXTS
+                or text == BTN_CONTACT
+                or in_report
+                or getattr(event, "photo", None) and in_report
+            )
+            if not allowed_now:
+                await self._deny(event,
+                    "⏳ Hesabınız təsdiq gözləyir.\n\n"
+                    "Admin sizi aktivləşdirdikdən sonra botdan istifadə edə "
+                    "biləcəksiniz. Müraciət üçün ✉️ Əlaqə düyməsindən istifadə edin.")
+                return None
+
         return await handler(event, data)
+
+    @staticmethod
+    async def _deny(event, text: str):
+        try:
+            if isinstance(event, Message):
+                await event.answer(text)
+            elif isinstance(event, CallbackQuery):
+                await event.answer(text, show_alert=True)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
-BTN_LOGIN = "🔑 Login"
-BTN_NEW = "➕ New listing"
-BTN_ADS = "📋 My ads"
+BTN_LOGIN = "🔑 Giriş"
+BTN_NEW = "➕ Yeni elan"
+BTN_ADS = "📋 Elanlarım"
 BTN_STATUS = "🩺 Status"
-BTN_SESSIONS = "📱 Sessions"
+BTN_SESSIONS = "📱 Sessiyalar"
 BTN_ADMIN = "🛠 Admin"
 
 # sessions sub-menu
-BTN_S_NEW = "➕ New session"
-BTN_S_SWITCH = "🔀 Switch number"
-BTN_S_LIST = "📄 My numbers"
-BTN_S_FORGET = "🚪 Forget session"
-BTN_S_REMOVE = "🗑 Remove number"
-BTN_CONTACT = "✉️ Contact / Report"
+BTN_S_NEW = "➕ Yeni sessiya"
+BTN_S_SWITCH = "🔀 Nömrəni dəyiş"
+BTN_S_LIST = "📄 Nömrələrim"
+BTN_S_FORGET = "🚪 Sessiyanı unut"
+BTN_S_REMOVE = "🗑 Nömrəni sil"
+BTN_CONTACT = "✉️ Əlaqə"
 
 # admin sub-menu
-BTN_A_PENDING = "⏳ Pending users"
-BTN_A_USERS = "👥 All users"
-BTN_A_SETSTATUS = "✅ Set status"
-BTN_A_SETTIER = "⭐ Set tier"
-BTN_A_BACK = "⬅️ Back"
+BTN_A_PENDING = "⏳ Gözləyən istifadəçilər"
+BTN_A_USERS = "👥 Bütün istifadəçilər"
+BTN_A_SETSTATUS = "✅ Status təyin et"
+BTN_A_SETTIER = "⭐ Tarif təyin et"
+BTN_A_BACK = "⬅️ Geri"
 
 
 _current_uid: contextvars.ContextVar = contextvars.ContextVar("uid", default=None)
@@ -203,15 +264,27 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 @dp.message(CommandStart())
-async def start(msg: Message, state: FSMContext):
+async def start(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
     uid = msg.from_user.id
     uname = msg.from_user.username or ""
     fname = msg.from_user.full_name or ""
+    is_new = U.get_user(uid) is None
     U.ensure_user(uid, default_status="active" if uid in ADMIN_IDS else "pending",
                   username=uname, name=fname)
     if uid in ADMIN_IDS and not U.is_active(uid):
         U.set_status(uid, "active")
+    # Tell the admins a new person is waiting for approval.
+    if is_new and uid not in ADMIN_IDS:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    "🆕 <b>Yeni istifadəçi qeydiyyatdan keçdi</b>\n"
+                    f"{U.label_for(uid)}\n\n"
+                    "Təsdiqləmək üçün ID-yə toxunun.")
+            except Exception:
+                pass
     rec = U.get_user(uid) or {}
     tier_az = {"free": "Pulsuz", "pro": "Pro", "diamond": "Diamond"}.get(rec.get("tier","free"), rec.get("tier"))
     status_az = {"active": "Aktiv", "pending": "Gözləmədə", "blocked": "Bloklanıb"}.get(rec.get("status","?"), rec.get("status"))
