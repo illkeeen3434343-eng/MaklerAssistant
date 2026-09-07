@@ -119,6 +119,14 @@ class Whitelist(BaseMiddleware):
         _current_uid.set(uid)
         _last_user_id[getattr(getattr(event, "chat", None), "id", uid) or uid] = uid
 
+        # usage statistics (#2) — record button/command presses only
+        try:
+            t = (getattr(event, "text", "") or "").strip()
+            if t and (t in MENU_TEXTS or t.startswith("/")):
+                U.track(uid, t[:40])
+        except Exception:
+            pass
+
         # Admins always pass.
         if uid in ADMIN_IDS:
             return await handler(event, data)
@@ -179,17 +187,19 @@ BTN_ADMIN = "🛠 Admin"
 
 # sessions sub-menu
 BTN_S_NEW = "➕ Yeni sessiya"
-BTN_S_SWITCH = "🔀 Nömrəni dəyiş"
+BTN_S_SWITCH = "🔀 Nömrələr arası keçid"
 BTN_S_LIST = "📄 Nömrələrim"
-BTN_S_FORGET = "🚪 Sessiyanı unut"
+BTN_S_FORGET = "🚪 Sessiyanı dayandır"
 BTN_S_REMOVE = "🗑 Nömrəni sil"
 BTN_CONTACT = "✉️ Əlaqə"
+BTN_HELP = "❓ Kömək"
 
 # admin sub-menu
 BTN_A_PENDING = "⏳ Gözləyən istifadəçilər"
 BTN_A_USERS = "👥 Bütün istifadəçilər"
 BTN_A_SETSTATUS = "✅ Status təyin et"
 BTN_A_SETTIER = "⭐ Tarif təyin et"
+BTN_A_STATS = "📊 Statistika"
 BTN_A_BACK = "⬅️ Geri"
 
 
@@ -202,12 +212,12 @@ def main_menu(user_id: int | None = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_NEW)],
         [KeyboardButton(text=BTN_LOGIN), KeyboardButton(text=BTN_SESSIONS)],
         [KeyboardButton(text=BTN_ADS), KeyboardButton(text=BTN_STATUS)],
-        [KeyboardButton(text=BTN_CONTACT)],
+        [KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_HELP)],
     ]
     if uid is not None and uid in ADMIN_IDS:
         rows.append([KeyboardButton(text=BTN_ADMIN)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
-                               input_field_placeholder="Tap a button…")
+                               input_field_placeholder="Düymə seçin…")
 
 
 def sessions_menu() -> ReplyKeyboardMarkup:
@@ -228,6 +238,7 @@ def admin_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_A_PENDING), KeyboardButton(text=BTN_A_USERS)],
             [KeyboardButton(text=BTN_A_SETSTATUS), KeyboardButton(text=BTN_A_SETTIER)],
+            [KeyboardButton(text=BTN_A_STATS)],
             [KeyboardButton(text=BTN_A_BACK)],
         ],
         resize_keyboard=True,
@@ -235,28 +246,68 @@ def admin_menu() -> ReplyKeyboardMarkup:
     )
 
 
-# Tracks each user's currently-active bina.az number (defaults to BINA_PHONE).
+# Tracks each user's currently-active bina.az number.
 _active_number: dict[int, str] = {}
+# which admin action was requested before tapping a /id  (#3)
+_admin_intent: dict[int, str] = {}
+
+
+async def _notify(bot: Bot, user_id: int, text: str) -> bool:
+    """Send a notification to a user; True if delivered."""
+    try:
+        await bot.send_message(user_id, text)
+        return True
+    except Exception:
+        return False
+
+
+async def notify_admins(bot: Bot, text: str) -> int:
+    sent = 0
+    for admin_id in ADMIN_IDS:
+        if await _notify(bot, admin_id, text):
+            sent += 1
+    return sent
+
+
+async def report_error_to_admins(bot: Bot, user_id: int, where: str, err) -> None:
+    """#1 — summarise a user-facing failure for the admins."""
+    try:
+        await notify_admins(
+            bot,
+            "⚠️ <b>İstifadəçidə xəta</b>\n"
+            f"Kim: {U.label_for(user_id)}\n"
+            f"Harada: <b>{where}</b>\n"
+            f"Xəta: <code>{str(err)[:300]}</code>")
+    except Exception:
+        pass
 
 
 def active_phone(user_id: int) -> str | None:
+    """This user's active bina.az number — or None.
+
+    SECURITY: never fall back to the global BINA_PHONE (.env) for someone who
+    has not connected a number themselves. That value is the operator's own
+    number; leaking it made every new user see the admin's number as "active"
+    and could have let them act on the admin's session.
+    """
     if user_id in _active_number:
         return _active_number[user_id]
     nums = U.numbers(user_id)
     if nums:
         return nums[0]
-    return BINA_PHONE or None
+    # Only the operator/admins may use the .env convenience number.
+    if user_id in ADMIN_IDS and BINA_PHONE:
+        return BINA_PHONE
+    return None
 
 
 def phone_for(state_phone: str | None) -> str | None:
     if state_phone:
         return state_phone
     uid = _current_uid.get()
-    if uid is not None:
-        p = active_phone(uid)
-        if p:
-            return p
-    return BINA_PHONE or None
+    if uid is None:
+        return None
+    return active_phone(uid)
 
 
 # --------------------------------------------------------------------------
@@ -308,23 +359,23 @@ async def cmd_debug(msg: Message):
     # Anchor to the script's folder so it works regardless of cwd.
     debug_dir = Path(__file__).resolve().parent / "debug"
     if not debug_dir.exists():
-        await msg.answer(f"No debug/ folder yet at <code>{debug_dir}</code> — "
-                         "nothing has failed, or snapshots go elsewhere.")
+        await msg.answer(f"debug/ qovluğu yoxdur: <code>{debug_dir}</code> — "
+                         "heç bir xəta olmayıb.")
         return
     files = sorted(debug_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
-        await msg.answer(f"<code>{debug_dir}</code> is empty.")
+        await msg.answer(f"<code>{debug_dir}</code> boşdur.")
         return
-    await msg.answer(f"Found {len(files)} file(s) in debug/. Sending newest…")
+    await msg.answer(f"debug/ qovluğunda {len(files)} fayl var. Ən yenilər göndərilir…")
     sent = 0
     for f in files[:6]:
         try:
             await msg.answer_document(FSInputFile(str(f)), caption=f.name)
             sent += 1
         except Exception as exc:
-            await msg.answer(f"couldn't send {f.name}: {exc}")
-    await msg.answer(f"Sent {sent} file(s). The <code>*-open.html</code> ones "
-                     "show opened dropdowns — forward those to Claude.")
+            await msg.answer(f"{f.name} göndərilə bilmədi: {exc}")
+    await msg.answer(f"{sent} fayl göndərildi. <code>*-open.html</code> faylları "
+                     "açılmış siyahıları göstərir.")
 
 
 @dp.message(Command("cancel"))
@@ -351,7 +402,11 @@ async def wizard_button(call: CallbackQuery):
 
 
 @dp.message(F.photo)
-async def wizard_photo(msg: Message, bot: Bot):
+async def wizard_photo(msg: Message, bot: Bot, state: FSMContext):
+    # Report photos belong to the Contact flow — let that handler have them.
+    if await state.get_state() == Flow.report.state:
+        await _handle_report_photo(msg, state, bot)
+        return
     if ask.waiting_kind(msg.chat.id) != "photos":
         return
     # download the largest size to a temp file, hand the path to the broker
@@ -361,12 +416,13 @@ async def wizard_photo(msg: Message, bot: Bot):
     try:
         await bot.download(photo, destination=path)
         ask.feed_photo(msg.chat.id, path)
-        await msg.answer("📷 alındı — daha göndərin və ya ✅ Bitdi düyməsinə basın")
+        await msg.answer("📷 Minimum 4, maksimum 30 ədəd şəkil yükləyin.\n")
     except Exception as exc:
         await msg.answer(f"şəkli saxlaya bilmədim: {exc}")
 
 
 MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_SESSIONS, BTN_ADMIN,
+              BTN_HELP, BTN_A_STATS,
               BTN_S_NEW, BTN_S_SWITCH, BTN_S_LIST, BTN_S_FORGET, BTN_S_REMOVE,
               BTN_CONTACT,
               BTN_A_PENDING, BTN_A_USERS, BTN_A_SETSTATUS, BTN_A_SETTIER, BTN_A_BACK}
@@ -409,7 +465,7 @@ async def kb_login(msg: Message, state: FSMContext, bot: Bot):
     phone = phone_for(None)
     if not phone:
         await state.set_state(Flow.ask_phone)
-        await msg.answer("📱 bina.az nömrənizi göndərin (məs. <code>0557778899</code>):")
+        await msg.answer("📱 Nömrənizi daxil edin (məs. <code>557778899</code>):")
         return
     await run_login(bot, msg.chat.id, msg.from_user.id, phone, state)
 
@@ -448,8 +504,8 @@ async def _forward_report_to_admins(bot, msg, caption_text):
     return forwarded
 
 
-@dp.message(Flow.report, F.photo)
-async def got_report_photo(msg: Message, state: FSMContext, bot: Bot):
+async def _handle_report_photo(msg: Message, state: FSMContext, bot: Bot):
+    """Forward a photo report to the admins (shared by both photo handlers)."""
     await state.clear()
     uid = msg.from_user.id
     if not ADMIN_IDS:
@@ -461,6 +517,11 @@ async def got_report_photo(msg: Message, state: FSMContext, bot: Bot):
         "✅ Adminə göndərildi. Tezliklə cavab veriləcək." if n else
         "⚠️ Admin əlçatan deyil — sonra yenidən cəhd edin.",
         reply_markup=main_menu(uid))
+
+
+@dp.message(Flow.report, F.photo)
+async def got_report_photo(msg: Message, state: FSMContext, bot: Bot):
+    await _handle_report_photo(msg, state, bot)
 
 
 @dp.message(Flow.report)
@@ -485,7 +546,7 @@ async def got_report(msg: Message, state: FSMContext, bot: Bot):
 # ==================== SESSIONS SUBMENU (#2) ====================
 @dp.message(F.text == BTN_SESSIONS)
 async def kb_sessions(msg: Message):
-    await msg.answer("📱 <b>Sessiyalar</b> — qoşulmuş nömrələrinizi idarə edin.",
+    await msg.answer("📱 <b>Sessiyalar</b> — aktiv nömrələrinizi idarə edin.",
                      reply_markup=sessions_menu())
 
 
@@ -497,7 +558,7 @@ async def kb_s_list(msg: Message):
     lines = [f"<b>Your numbers</b> (tier {U.tier_of(uid)}, "
              f"max {U.max_numbers(uid)})", ""]
     if not nums and not act:
-        lines.append("None yet — use ➕ New session.")
+        lines.append("None yet — use Yeni sessiya.")
     for n in (nums or ([act] if act else [])):
         star = " ⭐ active" if act and n.lstrip('+').endswith(mask(act)[-2:]) else ""
         # show masked; mark active
@@ -510,17 +571,19 @@ async def kb_s_list(msg: Message):
 async def kb_s_new(msg: Message, state: FSMContext):
     uid = msg.from_user.id
     if U.get_user(uid) and U.get_user(uid)["status"] != "active" and uid not in ADMIN_IDS:
-        await msg.answer("⏳ Your account isn't active yet.", reply_markup=sessions_menu())
+        await msg.answer("Sizin hesabınız hələ ki aktivləşdirilmiyib.", reply_markup=sessions_menu())
         return
     cap = U.max_numbers(uid); have = len(U.numbers(uid))
     if have >= cap:
-        await msg.answer(f"Your tier ({U.tier_of(uid)}) allows {cap} number(s); "
-                         f"you have {have}. Ask an admin to upgrade.",
-                         reply_markup=sessions_menu())
+        await msg.answer(
+            f"Sizin ({U.tier_of(uid)}) abunəliyiniz {cap} ədəd nömrənin "
+            f"istifadə edilməsinə imkan verir. Sizin aktiv {have} nömrəniz "
+            f"mövcuddur. Abunəliyinizi dəyişmək üçün adminlə əlaqə saxlayın.",
+            reply_markup=sessions_menu())
         return
     await state.set_state(Flow.ask_phone)
-    await msg.answer("➕ Send the bina.az number to connect "
-                     "(e.g. <code>0701112233</code>). I'll send you the SMS step next.")
+    await msg.answer("➕ Nömrənizi daxil edin (Nümunə: <code>0701112233</code>). "
+                     "Giriş üçün təsdiq kodu göndəriləcək.")
 
 
 @dp.message(F.text == BTN_S_SWITCH)
@@ -528,19 +591,19 @@ async def kb_s_switch(msg: Message, bot: Bot, state: FSMContext):
     uid = msg.from_user.id
     nums = U.numbers(uid)
     if len(nums) < 2:
-        await msg.answer("Yalnız bir nömrəniz var. ➕ Yeni sessiya ilə başqa nömrə əlavə edin.",
+        await msg.answer("Cəmi bir nömrəniz var. ➕ Yeni sessiya ilə başqa nömrə əlavə edin.",
                          reply_markup=sessions_menu())
         return
     opts = [(mask(n), n) for n in nums]
     chat_id = msg.chat.id
     if lock_for(chat_id).locked():
-        await msg.answer("⏳ Məşğul — əvvəlki əməliyyatı bitirin.")
+        await msg.answer("⏳ Aktiv proses mövcuddur. Yenisi üçün əvvəlki əməliyyatı bitirin.")
         return
     async with lock_for(chat_id):
         try:
             chosen = await ask.ask_choice(bot, chat_id, "Aktiv nömrəni dəyişin:", opts)
             _active_number[uid] = chosen
-            await bot.send_message(chat_id, f"🔀 Active number is now {mask(chosen)}.",
+            await bot.send_message(chat_id, f"Hazırda aktiv olan nömrəniz: {mask(chosen)}",
                                    reply_markup=sessions_menu())
         except Cancelled:
             await bot.send_message(chat_id, "Ləğv edildi.", reply_markup=sessions_menu())
@@ -560,7 +623,7 @@ async def kb_s_forget(msg: Message):
         f"🚪 Login session for {mask(phone) if phone else 'this number'} cleared "
         "— the next action will ask for a fresh SMS code.\n\n"
         "<i>The number stays connected to your account. To remove it entirely, "
-        "use 🗑 Remove number.</i>",
+        "use Nömrəni sil.</i>",
         reply_markup=sessions_menu())
 
 
@@ -573,13 +636,13 @@ async def kb_s_remove(msg: Message, bot: Bot, state: FSMContext):
         return
     chat_id = msg.chat.id
     if lock_for(chat_id).locked():
-        await msg.answer("⏳ Məşğul — əvvəlki əməliyyatı bitirin.")
+        await msg.answer("⏳ Aktiv proses mövcuddur. Yenisi üçün əvvəlki əməliyyatı bitirin.")
         return
     async with lock_for(chat_id):
         try:
             opts = [(mask(n), n) for n in nums]
             chosen = await ask.ask_choice(bot, chat_id,
-                "Hesabınızdan hansı nömrəni silək?", opts)
+                "Silmək istədiyniz nömrəni seçin.", opts)
             # clear its saved session, drop it from the user's list
             sess = get_session(uid, chosen)
             sess.forget()
@@ -587,16 +650,108 @@ async def kb_s_remove(msg: Message, bot: Bot, state: FSMContext):
             U.remove_number(uid, chosen)
             _active_number.pop(uid, None)
             await bot.send_message(chat_id,
-                f"🗑 Removed {mask(chosen)} from your account.\n\n"
-                "<i>Note: the number stays reserved to your Telegram ID for "
-                "privacy. To reassign it to someone else, contact an admin via "
-                "✉️ Contact / Report.</i>",
+                f"🗑 {mask(chosen)} nömrəniz hesabdan silindi.\n\n"
+                "<i>Silinən nömrə sizə məxsus olduğu üçün başqa istifadəçi "
+                "tərəfindən istifadə edilə bilməz. Əgər nömrə artıq sizə aid "
+                "deyilsə, nömrənin adınızdan silinməsi üçün admin ilə əlaqə "
+                "saxlayın.</i>",
                 reply_markup=sessions_menu())
         except Cancelled:
             await bot.send_message(chat_id, "Ləğv edildi.", reply_markup=sessions_menu())
         except asyncio.TimeoutError:
             await bot.send_message(chat_id, "⏰ Vaxt bitdi.", reply_markup=sessions_menu())
 # ==================== END SESSIONS SUBMENU ====================
+
+
+# ==================== KÖMƏK (#9) ====================
+HELP_TEXT = """❓ <b>MaklerAssistant — kömək</b>
+
+Bu bot bina.az hesabınızı Telegram üzərindən idarə etməyə imkan verir: elan
+yerləşdirmək və elanlarınıza baxmaq.
+
+<b>1. Necə işləyir?</b>
+Bot sizin adınızdan bina.az saytına daxil olur. Giriş üçün bina.az sizin
+telefonunuza SMS kod göndərir, siz kodu bota yazırsınız, bot girişi tamamlayır.
+Sessiya yadda saxlanılır — hər dəfə SMS lazım olmur (adətən bir neçə gün).
+
+<b>2. Başlamaq</b>
+• Qeydiyyat: /start yazın. Hesabınız <b>təsdiq gözləyir</b> statusunda olur.
+• Admin sizi aktivləşdirdikdən sonra bütün funksiyalar açılır.
+• Sonra 📱 Sessiyalar → ➕ Yeni sessiya ilə bina.az nömrənizi qoşun.
+
+<b>3. Düymələr</b>
+• ➕ <b>Yeni elan</b> — addım-addım yeni elan yerləşdirir (növ, şəhər, rayon,
+  ünvan, otaq, sahə, mərtəbə, təmir, şəkil, qiymət, əlaqə).
+• 📋 <b>Elanlarım</b> — bina.az-dakı elanlarınızı göstərir (qəbul olunmayanlar
+  daxil olmaqla).
+• 🔑 <b>Giriş</b> — hesaba daxil olur / sessiyanı yoxlayır.
+• 📱 <b>Sessiyalar</b> — nömrələrinizi idarə edin:
+   ➕ Yeni sessiya · 🔀 Nömrəni dəyiş · 📄 Nömrələrim
+   🚪 Sessiyanı unut (yalnız girişi silir, nömrə qalır)
+   🗑 Nömrəni sil (nömrəni hesabınızdan çıxarır)
+• 🩺 <b>Status</b> — aktiv nömrə, sessiya və tarif məlumatı.
+• ✉️ <b>Əlaqə</b> — admin ilə əlaqə (mətn və ya şəkil göndərə bilərsiniz).
+
+<b>4. Şəkillər</b>
+bina.az minimum <b>4</b>, maksimum <b>30</b> şəkil tələb edir. Skrinşot, loqolu,
+çərçivəli və ya bulanıq şəkillər qəbul edilmir.
+
+<b>5. Tariflər</b>
+Pulsuz — 1 nömrə · Pro — 2 nömrə · Diamond — 5 nömrə.
+Tarifi dəyişmək üçün admin ilə əlaqə saxlayın.
+
+<b>6. Elan statusu</b>
+Elan göndərildikdən sonra bina.az moderatorları yoxlayır. Nəticəni
+📋 Elanlarım bölməsində görə bilərsiniz.
+
+<b>7. Problem olarsa</b>
+✉️ Əlaqə düyməsi ilə yazın — mesajınız (və şəkil) birbaşa adminə gedir.
+İstənilən addımı dayandırmaq üçün /cancel yazın."""
+
+
+@dp.message(F.text == BTN_HELP)
+@dp.message(Command("help"))
+async def kb_help(msg: Message):
+    await msg.answer(HELP_TEXT, reply_markup=main_menu(msg.from_user.id))
+
+
+# ==================== STATİSTİKA (#2) ====================
+@dp.message(F.text == BTN_A_STATS)
+async def kb_admin_stats(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    s = U.stats_summary()
+    users = U.all_users()
+    by_status: dict[str, int] = {}
+    by_tier: dict[str, int] = {}
+    numbers = 0
+    for r in users.values():
+        by_status[r.get("status", "?")] = by_status.get(r.get("status", "?"), 0) + 1
+        by_tier[r.get("tier", "free")] = by_tier.get(r.get("tier", "free"), 0) + 1
+        numbers += len(r.get("numbers", []))
+
+    lines = ["📊 <b>Statistika</b>", ""]
+    lines.append(f"👥 İstifadəçi: <b>{len(users)}</b> · bu gün aktiv: "
+                 f"<b>{s['active_today']}</b>")
+    lines.append("   " + " · ".join(f"{k}: {v}" for k, v in by_status.items()))
+    lines.append("   Tarif — " + " · ".join(f"{k}: {v}" for k, v in by_tier.items()))
+    lines.append(f"📱 Qoşulmuş nömrə: <b>{numbers}</b>")
+    lines.append(f"🖱 Ümumi əməliyyat: <b>{s['total_actions']}</b>")
+
+    if s["top_actions"]:
+        lines += ["", "<b>Ən çox istifadə olunan düymələr</b>"]
+        for name, cnt in s["top_actions"]:
+            lines.append(f"   {cnt:>4} × {name}")
+
+    if s["top_users"]:
+        lines += ["", "<b>Ən aktiv istifadəçilər</b>"]
+        for uid, total, last in s["top_users"]:
+            if not total:
+                continue
+            lines.append(f"   {U.label_for(int(uid))} — {total} əməliyyat "
+                         f"(son: {last.replace('T', ' ')[:16]})")
+
+    await msg.answer("\n".join(lines)[:3800], reply_markup=admin_menu())
 
 
 # ==================== ADMIN PANEL (#5, #6, #7) ====================
@@ -610,7 +765,7 @@ async def kb_admin(msg: Message):
         await msg.answer("⛔️ Yalnız adminlər üçün.")
         return
     # #7: main buttons -> tap Admin -> admin buttons + Back appear
-    await msg.answer("🛠 <b>Admin panel</b>\nManage users, statuses and tiers.",
+    await msg.answer("🛠 <b>Admin paneli</b>\nİstifadəçiləri, statusları və tarifləri idarə edin.",
                      reply_markup=admin_menu())
 
 
@@ -643,14 +798,14 @@ async def kb_admin_pending(msg: Message):
 
 
 @dp.message(F.text == BTN_A_USERS)
-async def kb_admin_users(msg: Message):
+async def kb_admin_users(msg: Message, header: str | None = None):
     if not _is_admin(msg.from_user.id):
         return
     data = U.all_users()
     if not data:
         await msg.answer("Hələ istifadəçi yoxdur.", reply_markup=admin_menu())
         return
-    lines = ["👥 <b>Bütün istifadəçilər</b>",
+    lines = [header or "👥 <b>Bütün istifadəçilər</b>",
              "İdarə etmək üçün ID-yə toxunun:", ""]
     for u, r in data.items():
         lines.append(_user_line(u, r))
@@ -661,14 +816,16 @@ async def kb_admin_users(msg: Message):
 async def kb_admin_setstatus(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
-    await kb_admin_users(msg)   # show the clickable list; tapping an ID opens actions
+    _admin_intent[msg.from_user.id] = "status"
+    await kb_admin_users(msg, header="✅ <b>Status təyin et</b> — istifadəçi ID-sinə toxunun:")
 
 
 @dp.message(F.text == BTN_A_SETTIER)
 async def kb_admin_settier(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
-    await kb_admin_users(msg)
+    _admin_intent[msg.from_user.id] = "tier"
+    await kb_admin_users(msg, header="⭐ <b>Tarif təyin et</b> — istifadəçi ID-sinə toxunun:")
 
 
 # Tapping a "/123456" line opens an action menu for that user (admin only).
@@ -676,42 +833,138 @@ async def kb_admin_settier(msg: Message):
 async def admin_pick_user(msg: Message, bot: Bot):
     if not _is_admin(msg.from_user.id):
         return
+    admin_id = msg.from_user.id
     target = int(msg.text.strip().lstrip("/"))
     chat_id = msg.chat.id
     if lock_for(chat_id).locked():
-        await msg.answer("⏳ Məşğul — əvvəlki əməliyyatı bitirin.")
+        await msg.answer("⏳ Aktiv proses mövcuddur. Yenisi üçün əvvəlki əməliyyatı bitirin.")
         return
+    intent = _admin_intent.pop(admin_id, None)
     async with lock_for(chat_id):
         try:
             U.ensure_user(target)
-            action = await ask.ask_choice(bot, chat_id,
-                f"{U.label_for(target)} — nə edək?",
-                [("✅ Aktiv et", "st:active"), ("⏳ Gözləmə", "st:pending"),
-                 ("🚫 Blokla", "st:blocked"),
-                 ("⭐ Tarif: Pulsuz", "ti:free"), ("⭐ Tarif: Pro", "ti:pro"),
-                 ("⭐ Tarif: Diamond", "ti:diamond")])
-            kind, val = action.split(":")
+            if intent == "status":
+                opts = [("✅ Aktiv et", "st:active"), ("⏳ Gözləmə", "st:pending"),
+                        ("🚫 Blokla", "st:blocked")]
+            elif intent == "tier":
+                opts = [("⭐ Pulsuz (1 nömrə)", "ti:free"),
+                        ("⭐ Pro (2 nömrə)", "ti:pro"),
+                        ("⭐ Diamond (5 nömrə)", "ti:diamond")]
+            else:
+                opts = [("✅ Status dəyiş", "go:status"),
+                        ("⭐ Tarif dəyiş", "go:tier"),
+                        ("📱 Nömrələri idarə et", "go:numbers"),
+                        ("✉️ Mesaj göndər", "go:msg")]
+            action = await ask.ask_choice(
+                bot, chat_id, f"{U.label_for(target)} — nə edək?", opts)
+            kind, val = action.split(":", 1)
+
+            if kind == "go":
+                if val == "status":
+                    _admin_intent[admin_id] = "status"
+                elif val == "tier":
+                    _admin_intent[admin_id] = "tier"
+                if val in ("status", "tier"):
+                    await bot.send_message(
+                        chat_id, f"Yenidən <code>/{target}</code> yazın "
+                                 f"və ya ID-yə toxunun.", reply_markup=admin_menu())
+                    return
+                if val == "numbers":
+                    await _admin_manage_numbers(bot, chat_id, target)
+                    return
+                if val == "msg":
+                    await _admin_message_user(bot, chat_id, target)
+                    return
+
             if kind == "st":
                 U.set_status(target, val)
-                az = {"active":"Aktiv","pending":"Gözləmədə","blocked":"Bloklandı"}[val]
+                az = {"active": "Aktiv", "pending": "Gözləmədə",
+                      "blocked": "Bloklandı"}[val]
                 await bot.send_message(chat_id, f"✅ {U.label_for(target)} → {az}",
                                        reply_markup=admin_menu())
-                try:
-                    await bot.send_message(target, f"ℹ️ Admin statusunuzu dəyişdi: <b>{az}</b>.")
-                except Exception:
-                    pass
-            else:
+                await _notify(bot, target,
+                              f"ℹ️ Admin statusunuzu dəyişdi: <b>{az}</b>."
+                              + ("\n\nArtıq botdan istifadə edə bilərsiniz. /start"
+                                 if val == "active" else ""))
+            elif kind == "ti":
                 U.set_tier(target, val)
+                cap = U.TIERS[val]["max_numbers"]
                 await bot.send_message(chat_id, f"⭐ {U.label_for(target)} → {val}",
                                        reply_markup=admin_menu())
-                try:
-                    await bot.send_message(target, f"⭐ Tarifiniz dəyişdirildi: <b>{val}</b>.")
-                except Exception:
-                    pass
+                await _notify(bot, target,
+                              f"⭐ Tarifiniz dəyişdirildi: <b>{val}</b> "
+                              f"({cap} nömrə).")
         except Cancelled:
             await bot.send_message(chat_id, "Ləğv edildi.", reply_markup=admin_menu())
         except asyncio.TimeoutError:
             await bot.send_message(chat_id, "⏰ Vaxt bitdi.", reply_markup=admin_menu())
+
+
+async def _admin_manage_numbers(bot: Bot, chat_id: int, target: int):
+    """#8 — assign a number to a user, or unassign one from them."""
+    nums = U.numbers(target)
+    listing = "\n".join(f"• {mask(n)}" for n in nums) or "<i>nömrə yoxdur</i>"
+    act = await ask.ask_choice(
+        bot, chat_id,
+        f"{U.label_for(target)}\nNömrələr:\n{listing}\n\nNə edək?",
+        [("➕ Nömrə təyin et", "add"), ("➖ Nömrəni ayır", "del")])
+    if act == "add":
+        phone = (await ask.ask_text(
+            bot, chat_id, "Təyin ediləcək nömrəni yazın (məs. 0557778899):")).strip()
+        owner = security.owner_of(phone)
+        if owner is not None and str(owner) != str(target):
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Bu nömrə artıq <code>{owner}</code> istifadəçisinə aiddir. "
+                f"Əvvəlcə ondan ayırın.", reply_markup=admin_menu())
+            return
+        security.claim(phone, target)
+        ok, note = U.add_number(target, phone)
+        await bot.send_message(
+            chat_id,
+            f"✅ {mask(phone)} → {U.label_for(target)}" if ok else f"⚠️ {note}",
+            reply_markup=admin_menu())
+        if ok:
+            await _notify(bot, target,
+                          f"📱 Admin hesabınıza yeni nömrə əlavə etdi: {mask(phone)}")
+    else:
+        if not nums:
+            await bot.send_message(chat_id, "Bu istifadəçinin nömrəsi yoxdur.",
+                                   reply_markup=admin_menu())
+            return
+        chosen = await ask.ask_choice(bot, chat_id, "Hansı nömrəni ayıraq?",
+                                      [(mask(n), n) for n in nums])
+        security.release(chosen, target)
+        U.remove_number(target, chosen)
+        try:
+            sess = get_session(target, chosen)
+            sess.forget()
+            await sess.close()
+        except Exception:
+            pass
+        _active_number.pop(target, None)
+        await bot.send_message(chat_id,
+                               f"➖ {mask(chosen)} ayrıldı ({U.label_for(target)}).",
+                               reply_markup=admin_menu())
+        await _notify(bot, target,
+                      f"📱 Admin {mask(chosen)} nömrəsini hesabınızdan ayırdı.")
+
+
+async def _admin_message_user(bot: Bot, chat_id: int, target: int):
+    """#4 — admin sends a direct message to a user."""
+    text = (await ask.ask_text(
+        bot, chat_id,
+        f"{U.label_for(target)} istifadəçisinə göndəriləcək mesajı yazın:")).strip()
+    if not text:
+        await bot.send_message(chat_id, "Boş mesaj göndərilmədi.",
+                               reply_markup=admin_menu())
+        return
+    ok = await _notify(bot, target, f"✉️ <b>Admindən mesaj</b>\n\n{text}")
+    await bot.send_message(
+        chat_id,
+        "✅ Göndərildi." if ok else "⚠️ İstifadəçiyə çatdırıla bilmədi "
+                                    "(botu bloklamış ola bilər).",
+        reply_markup=admin_menu())
 # ==================== END ADMIN PANEL ====================
 
 
@@ -730,8 +983,8 @@ async def kb_status(msg: Message):
     enc = "on" if security.encryption_enabled() else "off"
     await msg.answer(
         f"<b>{mask(phone)}</b>\n"
-        f"Saved session: {'🟢 yes' if saved else '⚪️ none (will need SMS)'}\n"
-        f"Encryption: {enc} · owned by you: {'yes' if owner else 'unclaimed'}",
+        f"Yadda saxlanan sessiya: {'🟢 var' if saved else '⚪️ yoxdur (SMS lazımdır)'}\n"
+        f"Şifrələmə: {enc} · sizə aiddir: {'bəli' if owner else 'təyin olunmayıb'}",
         reply_markup=main_menu())
 
 
@@ -739,11 +992,11 @@ async def kb_status(msg: Message):
 async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
     phone = phone_for(None)
     if not phone:
-        await msg.answer("Əvvəlcə nömrə əlavə edin (🔑 Giriş).")
+        await msg.answer("Əvvəlcə nömrə daxil edin (🔑 Giriş).")
         return
     chat_id = msg.chat.id
     if lock_for(chat_id).locked():
-        await msg.answer("⏳ Məşğul — eyni anda bir əməliyyat.")
+        await msg.answer("⏳ Məşğul — eyni anda bir əməliyyat icra oluna bilər.")
         return
     async with lock_for(chat_id):
         ok = await ensure_login(bot, chat_id, msg.from_user.id, phone, state)
@@ -756,11 +1009,11 @@ async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
                 ads = await PublishFlow(sess).fetch_my_ads()
         except Exception as exc:
             log.exception("fetch my ads")
-            await bot.send_message(chat_id, f"❌ Couldn't read your ads: {exc}",
+            await bot.send_message(chat_id, f"Elanlarınız barədə məlumat əldə edilə bilmədi: {exc}",
                                    reply_markup=main_menu())
             return
     if not ads:
-        await bot.send_message(chat_id, "Bu hesabda hələ elan yoxdur.",
+        await bot.send_message(chat_id, "Bu hesabda heç bir elan yoxdur.",
                                reply_markup=main_menu())
         return
     lines = [f"📋 <b>Your ads ({len(ads)})</b> — {mask(phone)}", ""]
@@ -793,10 +1046,10 @@ async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
 async def kb_new(msg: Message, bot: Bot, state: FSMContext):
     phone = phone_for(None)
     if not phone:
-        await msg.answer("Əvvəlcə nömrə əlavə edin (🔑 Giriş).")
+        await msg.answer("Əvvəlcə nömrə daxil edin (🔑 Giriş).")
         return
     if lock_for(msg.chat.id).locked():
-        await msg.answer("⏳ Məşğul — eyni anda bir əməliyyat.")
+        await msg.answer("⏳ Məşğul — eyni anda bir əməliyyat icra oluna bilər.")
         return
     async with lock_for(msg.chat.id):
         ok = await ensure_login(bot, msg.chat.id, msg.from_user.id, phone, state)
@@ -810,7 +1063,7 @@ async def kb_new(msg: Message, bot: Bot, state: FSMContext):
         except PublishError as exc:
             await bot.send_message(msg.chat.id, f"❌ {exc}", reply_markup=main_menu())
         except asyncio.TimeoutError:
-            await bot.send_message(msg.chat.id, "⏰ Cavab gözlənilərkən vaxt bitdi.", reply_markup=main_menu())
+            await bot.send_message(msg.chat.id, "⏰ Cavab gözləmə müddəti bitdi.", reply_markup=main_menu())
         except Exception as exc:
             log.exception("publish wizard error")
             await bot.send_message(msg.chat.id, f"💥 {exc}", reply_markup=main_menu())
@@ -835,8 +1088,8 @@ async def cb_login(call: CallbackQuery, state: FSMContext, bot: Bot):
     phone = phone_for(None)
     if not phone:
         await state.set_state(Flow.ask_phone)
-        await call.message.answer("📱 Send your bina.az number "
-                                  "(e.g. <code>0557778899</code>):")
+        await call.message.answer(
+            "📱 Nömrənizi daxil edin (Nümunə: <code>0701112233</code>).")
         return
     await run_login(bot, call.message.chat.id, call.from_user.id, phone, state)
 
@@ -859,15 +1112,15 @@ async def cb_status(call: CallbackQuery):
     enc = "on" if security.encryption_enabled() else "off"
     await call.message.answer(
         f"<b>{mask(phone)}</b>\n"
-        f"Saved session: {'🟢 yes' if saved else '⚪️ none (will need SMS)'}\n"
-        f"Encryption: {enc} · owned by you: {'yes' if owner else 'unclaimed'}",
+        f"Yadda saxlanan sessiya: {'🟢 var' if saved else '⚪️ yoxdur (SMS lazımdır)'}\n"
+        f"Şifrələmə: {enc} · sizə aiddir: {'bəli' if owner else 'təyin olunmayıb'}",
         reply_markup=main_menu(),
     )
 
 
 @dp.callback_query(F.data == "logout")
 async def cb_logout(call: CallbackQuery):
-    await call.answer("Session forgotten")
+    await call.answer("Dayandırılmış sessiyalar")
     phone = phone_for(None)
     user_id = call.from_user.id
     if phone and (security.owner_of(phone) in (None, user_id) or
@@ -876,8 +1129,8 @@ async def cb_logout(call: CallbackQuery):
         sess.forget()
         await sess.close()
     await call.message.answer(
-        "🚪 Saved session cleared. Next login needs an SMS code.\n"
-        "<i>(You still own this number — it stays reserved to you.)</i>",
+        "🚪 Yadda saxlanan sessiya silindi. Növbəti girişdə təsdiq kodu lazım olacaq.\n"
+        "<i>(Sessiya dayandırılsa da nömrə sizə məxsusdur.)</i>",
         reply_markup=main_menu())
 
 
@@ -886,18 +1139,17 @@ async def cb_myads(call: CallbackQuery, bot: Bot, state: FSMContext):
     await call.answer()
     phone = phone_for(None)
     if not phone:
-        await call.message.answer("Əvvəlcə nömrə əlavə edin (🔑 Giriş).")
+        await call.message.answer("Əvvəlcə nömrə daxil edin (🔑 Giriş).")
         return
     chat_id = call.message.chat.id
     if lock_for(chat_id).locked():
-        await call.message.answer("⏳ Məşğul — eyni anda bir əməliyyat.")
+        await call.message.answer("⏳ Məşğul — eyni anda bir əməliyyat icra oluna bilər.")
         return
     async with lock_for(chat_id):
         ok = await ensure_login(bot, chat_id, call.from_user.id, phone, state)
         if not ok:
             return
-        await call.message.answer("📋 You're logged in. (Ad-listing readout is the "
-                                  "next feature to add — the session is ready for it.)",
+        await call.message.answer("📋 Giriş uğurludur.",
                                   reply_markup=main_menu())
 
 
@@ -928,11 +1180,11 @@ async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
     await call.answer()
     phone = phone_for(None)
     if not phone:
-        await call.message.answer("Əvvəlcə nömrə əlavə edin (🔑 Giriş).")
+        await call.message.answer("Əvvəlcə nömrə daxil edin (🔑 Giriş).")
         return
     chat_id = call.message.chat.id
     if lock_for(chat_id).locked():
-        await call.message.answer("⏳ Məşğul — eyni anda bir əməliyyat.")
+        await call.message.answer("⏳ Məşğul — eyni anda bir əməliyyat icra oluna bilər.")
         return
     async with lock_for(chat_id):
         ok = await ensure_login(bot, chat_id, call.from_user.id, phone, state)
@@ -944,10 +1196,10 @@ async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
         except Cancelled:
             await bot.send_message(chat_id, "🛑 Elan yerləşdirmə ləğv edildi.", reply_markup=main_menu())
         except PublishError as exc:
-            await bot.send_message(chat_id, f"❌ {exc}\nA debug snapshot was saved.",
+            await bot.send_message(chat_id, f"❌ {exc}\nDebug şəkli saxlanıldı.",
                                    reply_markup=main_menu())
         except asyncio.TimeoutError:
-            await bot.send_message(chat_id, "⏰ Cavab gözlənilərkən vaxt bitdi.", reply_markup=main_menu())
+            await bot.send_message(chat_id, "⏰ Cavab gözləmə müddəti bitdi.", reply_markup=main_menu())
         except Exception as exc:
             log.exception("publish wizard error")
             await bot.send_message(chat_id, f"💥 {exc}", reply_markup=main_menu())
@@ -964,17 +1216,15 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
     """
     options = await flow.discover_options(opener_key, filter_text=filter_text, tag=tag)
     if not options and known:
-        await bot.send_message(chat_id, f"ℹ️ Using the known {tag} list.")
+        await bot.send_message(chat_id, f"ℹ️ {tag} üçün hazır siyahı istifadə olunur.")
         options = list(known)
     if not options:
         if optional:
             await bot.send_message(
-                chat_id, f"ℹ️ Couldn't read the {tag} options — keeping the "
-                         f"field's current value. (Use /debug to inspect.)")
+                chat_id, f"ℹ️ {tag} variantları oxuna bilmədi — mövcud dəyər saxlanılır.")
             return None
         raise PublishError(
-            f"Opened the {tag} dropdown but found no options. Run /debug and "
-            f"send me the *-{tag}-open.html to pin it.")
+            f"{tag} siyahısı açıldı, lakin variant tapılmadı.")
     note = ""
     if len(options) > 90:
         options = options[:90]
@@ -989,13 +1239,12 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
         # continue; the field may already hold an acceptable default.
         if not optional:
             raise
-        await bot.send_message(chat_id, f"⚠️ Couldn't click '{chosen_text}' — "
-                                        f"keeping the current {tag} value.")
+        await bot.send_message(chat_id, f"⚠️ '{chosen_text}' seçilə bilmədi — mövcud {tag} dəyəri saxlanılır.")
     return chosen_text
 
 
 async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
-                     known=None, optional=False):
+                     known=None, optional=False, page_size=5):
     """Show the option buttons (from a known list), then select on the page.
 
     The choice buttons come from `known` (guaranteed-correct names). Once the
@@ -1006,15 +1255,15 @@ async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
     options = list(known) if known else await flow.search_and_pick(opener_key, "", tag=tag)
     if not options:
         if optional:
-            await bot.send_message(chat_id, f"No {tag} options — skipping.")
+            await bot.send_message(chat_id, f"{label}: variant tapılmadı — keçilir.")
             return None
-        raise PublishError(f"No {tag} options. Run /debug, send *-{tag}-open.html.")
+        raise PublishError(f"{label}: variant tapılmadı.")
 
     page = 0
     while True:
-        chunk = options[page * 5:(page + 1) * 5]
-        opts = [(r[:40], f"r{page*5+i}") for i, r in enumerate(chunk)]
-        if (page + 1) * 5 < len(options):
+        chunk = options[page * page_size:(page + 1) * page_size]
+        opts = [(r[:40], f"r{page*page_size+i}") for i, r in enumerate(chunk)]
+        if (page + 1) * page_size < len(options):
             opts.append(("➡️ Digər", "more"))
         chosen = await ask.ask_choice(bot, chat_id, f"{label}:", opts)
         if chosen == "more":
@@ -1032,16 +1281,16 @@ async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
             await flow.pick_result(target, tag=tag)
         elif not optional:
             await bot.send_message(chat_id,
-                f"⚠️ Typed '{pick}' but saw no match on the page — continuing.")
+                f"⚠️ '{pick}' səhifədə tapılmadı — davam edirəm.")
     except PublishError:
         if not optional:
-            await bot.send_message(chat_id, f"⚠️ Couldn't select {pick} on the page.")
+            await bot.send_message(chat_id, f"⚠️ '{pick}' seçilə bilmədi.")
     return pick
 
 
 async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
     flow = PublishFlow(sess)
-    await bot.send_message(chat_id, "🏗 <b>Yeni elan</b> — başlayaq. Hər dəfə bir sual verəcəm.")
+    await bot.send_message(chat_id, "🏗 <b>Yeni elan</b>. Hər sual üçün yalnız 1 seçim edin.")
 
     async with sess.lock:
         await flow.open_new_ad()
@@ -1050,7 +1299,7 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.choose_deal(sell=True)
 
         # Category = property type. Asked ONCE here; sets the type dropdown.
-        cat = await ask.ask_choice(bot, chat_id, "Əmlakın növü?",
+        cat = await ask.ask_choice(bot, chat_id, "Əmlakın növünü seçin:",
                                    [("Yeni tikili", "Yeni tikili"),
                                     ("Köhnə tikili", "Köhnə tikili")])
         await flow.choose_category(cat)
@@ -1072,35 +1321,34 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         if (city or "").strip().lower() in ("bakı", "baki", "baku"):
             await _pick_list(bot, chat_id, flow, "district_button",
                              "Rayon", tag="district",
-                             known=BAKU_DISTRICTS, optional=True)
+                             known=BAKU_DISTRICTS, optional=True,
+                             page_size=len(BAKU_DISTRICTS))
             await _pick_list(bot, chat_id, flow, "village_button",
                              "Qəsəbə", tag="village", optional=True)
 
         address = await ask.ask_text(bot, chat_id,
-                                     "Dəqiq ünvan (yerləşmə)?")
+                                     "Ünvanı daxil edin:")
 
-        # Map: optionally pin the location on the map and confirm the popup (#4).
-        want_map = await ask.ask_choice(bot, chat_id,
-                                        "Yeri xəritədə qeyd edək?",
-                                        [("📍 Yes", "yes"), ("Skip", "no")])
-        if want_map == "yes":
-            ok = await flow.open_map_and_confirm()
-            await bot.send_message(chat_id,
-                "📍 Xəritə yeri təsdiqləndi." if ok else
-                "⚠️ Couldn't auto-confirm the map — set it manually later if needed.")
+        # Xəritədə yer qeydiyyatı MƏCBURİDİR — soruşmadan avtomatik edilir (#6).
+        try:
+            if not await flow.open_map_and_confirm():
+                await bot.send_message(
+                    chat_id, "⚠️ Xəritədə yeri təsdiqləyə bilmədim — davam edirəm.")
+        except Exception:
+            pass
 
-        rooms = await ask.ask_text(bot, chat_id, "Otaq sayı?")
-        area = await ask.ask_text(bot, chat_id, "Sahə (m²)?")
-        floor = await ask.ask_text(bot, chat_id, "Mərtəbə?")
-        total = await ask.ask_text(bot, chat_id, "Mərtəbələrin sayı?")
+        rooms = await ask.ask_text(bot, chat_id, "Otaq sayını daxil edin:")
+        area = await ask.ask_text(bot, chat_id, "Sahəni daxil edin (m²):")
+        floor = await ask.ask_text(bot, chat_id, "Mənzilin yerləşdiyi mərtəbəni daxil edin:")
+        total = await ask.ask_text(bot, chat_id, "Binanın neçə mərtəbə olduğunu daxil edin:")
 
-        repair = await ask.ask_choice(bot, chat_id, "Təmir?",
+        repair = await ask.ask_choice(bot, chat_id, "Təmirin növünü seçin:",
                                       [("Təmirli", "yes"), ("Təmirsiz", "no")])
         await flow.set_repair(repair == "yes")
 
         desc = await ask.ask_text(bot, chat_id,
-                                  "Əlavə məlumat (təsvir). Telefon/e-mail yazmayın.")
-        price = await ask.ask_text(bot, chat_id, "Qiymət (AZN)?")
+                                  "Elan barədə açıqlamanı qeyd edin:")
+        price = await ask.ask_text(bot, chat_id, "Mənzilin satış qiymətini daxil edin:")
 
         await flow.fill_details(address=address, rooms=rooms, area=area, floor=floor,
                                 total_floors=total, description=desc, price=price)
@@ -1119,23 +1367,23 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         while True:
             photos = await ask.ask_photos(
                 bot, chat_id,
-                "📷 Send your photos (at least <b>4</b>, at most <b>30</b>), "
-                "then tap ✅ Done.\n"
-                "<i>No screenshots, logos, framed or blurry photos.</i>")
+                "📷 Minimum 4, maksimum 30 ədəd şəkil yükləyin. "
+                "Bitirdikdə ✅ düyməsinə basın.\n"
+                "<i>Skrinşot, loqolu, çərçivəli və ya bulanıq şəkillər qəbul edilmir.</i>")
             if len(photos) < 4:
                 await bot.send_message(chat_id,
-                    f"Only {len(photos)} photo(s). bina.az needs at least 4 — "
-                    "send more.")
+                    f"Cəmi {len(photos)} ədəd şəkil yüklənib. "
+                    "Minimum 4 ədəd şəkil olmalıdır.")
                 continue
             if len(photos) > 30:
                 photos = photos[:30]
-                await bot.send_message(chat_id, "İlk 30 şəkil istifadə olunur.")
+                await bot.send_message(chat_id, "Minimum 4, maksimum 30 ədəd şəkil yükləyin.")
             break
         await flow.add_photos(photos)
 
         # contact
-        name = PUBLISHER_NAME or await ask.ask_text(bot, chat_id, "Adınız?")
-        email = PUBLISHER_EMAIL or await ask.ask_text(bot, chat_id, "E-mail ünvanınız?")
+        name = PUBLISHER_NAME or await ask.ask_text(bot, chat_id, "Adınızı daxil edin:")
+        email = PUBLISHER_EMAIL or await ask.ask_text(bot, chat_id, "E-mail ünvanınızı daxil edin:")
         await flow.fill_contact(name=name, email=email, is_owner=is_owner)
 
         # review + submit
@@ -1188,9 +1436,9 @@ async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str,
     if not check_ownership(phone, user_id):
         await bot.send_message(
             chat_id,
-            "🔒 This number is already connected to a different user account. "
-            "For privacy and security, a bina.az number can only be used by the "
-            "Telegram account that first connected it.",
+            "🔒 Bu nömrə artıq başqa istifadəçi tərəfindən daxil edilib. "
+            "Təhlükəsizlik səbəbi ilə bir nömrə yalnız bir istifadəçi "
+            "tərəfindən istifadə edilə bilər.",
             reply_markup=main_menu(),
         )
         return False
@@ -1200,7 +1448,7 @@ async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str,
         try:
             fresh = await sess.ensure_logged_in(await _otp_provider(bot, chat_id, state))
         except asyncio.TimeoutError:
-            await bot.send_message(chat_id, "⏰ Kod vaxtında gəlmədi.", reply_markup=main_menu())
+            await bot.send_message(chat_id, "⏰ Kodu vaxtında daxil etmədiniz.", reply_markup=main_menu())
             return False
         except LoginError as exc:
             await bot.send_message(chat_id, f"❌ {exc}", reply_markup=main_menu())
@@ -1211,21 +1459,22 @@ async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str,
             return False
     # Only mention a reused session when the user explicitly tapped Login.
     if not fresh and announce_reused:
-        await bot.send_message(chat_id, "✅ Artıq giriş edilib (yadda saxlanmış sessiya — SMS lazım deyil).")
+        await bot.send_message(chat_id, "✅ Artıq giriş edilib (aktiv sessiyanız olduğu üçün birdəfəlik kod lazım deyil).")
     return True
 
 
 async def run_login(bot: Bot, chat_id: int, user_id: int, phone: str, state: FSMContext):
     if lock_for(chat_id).locked():
-        await bot.send_message(chat_id, "⏳ Məşğul — eyni anda bir əməliyyat.")
+        await bot.send_message(chat_id, "⏳ Məşğul — eyni anda bir əməliyyat icra oluna bilər.")
         return
     async with lock_for(chat_id):
         ok = await ensure_login(bot, chat_id, user_id, phone, state, announce_reused=True)
         if ok:
             await bot.send_message(
                 chat_id,
-                f"✅ <b>Logged in</b> as {mask(phone)}.\n"
-                "Session saved — future actions should skip the SMS step.",
+                f"✅ {mask(phone)} nömrə ilə giriş edildi.\n"
+                "Artıq aktiv sessiya yaradıldığı üçün növbəti giriş zamanı "
+                "təsdiq kodu istənilməyəcək.",
                 reply_markup=main_menu(),
             )
 

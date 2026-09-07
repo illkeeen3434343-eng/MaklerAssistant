@@ -175,3 +175,70 @@ def remove_number(user_id: int, phone: str) -> None:
     if uid in data and d in data[uid]["numbers"]:
         data[uid]["numbers"].remove(d)
         _save(data)
+
+
+# ---------------------------------------------------------------- usage stats
+STATS_FILE = DATA_DIR / "stats.json"
+
+
+def _load_stats() -> dict:
+    if STATS_FILE.exists():
+        try:
+            return json.loads(STATS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_stats(data: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    os.replace(tmp, STATS_FILE)
+
+
+def track(user_id: int, action: str) -> None:
+    """Record one user action (button press / command) for statistics."""
+    if not action:
+        return
+    data = _load_stats()
+    uid = str(user_id)
+    rec = data.setdefault(uid, {"actions": {}, "first": _now(), "last": _now(),
+                                "days": {}, "total": 0})
+    rec["actions"][action] = rec["actions"].get(action, 0) + 1
+    rec["total"] = rec.get("total", 0) + 1
+    rec["last"] = _now()
+    day = _now()[:10]
+    rec["days"][day] = rec["days"].get(day, 0) + 1
+    # keep the day map small
+    if len(rec["days"]) > 90:
+        for k in sorted(rec["days"])[:-90]:
+            rec["days"].pop(k, None)
+    _save_stats(data)
+
+
+def stats_summary(top_n: int = 8) -> dict:
+    """Aggregate statistics across all users."""
+    data = _load_stats()
+    actions: dict[str, int] = {}
+    per_user = []
+    active_today = 0
+    today = _now()[:10]
+    for uid, rec in data.items():
+        for a, c in rec.get("actions", {}).items():
+            actions[a] = actions.get(a, 0) + c
+        per_user.append((uid, rec.get("total", 0), rec.get("last", "")))
+        if rec.get("days", {}).get(today):
+            active_today += 1
+    per_user.sort(key=lambda x: -x[1])
+    return {
+        "users": len(data),
+        "active_today": active_today,
+        "total_actions": sum(actions.values()),
+        "top_actions": sorted(actions.items(), key=lambda x: -x[1])[:top_n],
+        "top_users": per_user[:top_n],
+    }
+
+
+def user_stats(user_id: int) -> dict | None:
+    return _load_stats().get(str(user_id))

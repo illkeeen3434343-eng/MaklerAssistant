@@ -41,6 +41,11 @@ PUB = {
     "village_button": "[data-cy='item-form-village']",                 # confirmed (opener, appears after district)
     "address": "input[name='address']",                                # confirmed (Ünvan)
     "search_input": "[data-cy='search-input'], input[type='search']",    # confirmed (inside dropdowns)
+    # Each location field owns its OWN search box. Targeting them precisely
+    # prevents typing a district name into the city field.
+    "search_city": "[data-stat='item-form-find-city'] input[data-cy='search-input']",
+    "search_district": "[data-stat='item-form-find-region'] input[data-cy='search-input']",
+    "search_village": "[data-stat='item-form-find-village'] input[data-cy='search-input']",
     "rooms": "input[name='roomsAmount']",                               # confirmed
     "area": "input[name='area']",                                      # confirmed
     "floor": "input[name='floor']",                                    # confirmed
@@ -107,7 +112,7 @@ class PublishFlow:
             return
         except Exception as exc:
             await self.s.snapshot(f"publish-{what}")
-            raise PublishError(f"Could not click {what} ({selector}).") from exc
+            raise PublishError(f"{what} düyməsinə toxunmaq mümkün olmadı.") from exc
 
     async def _fill(self, selector: str, value: str, what: str):
         try:
@@ -141,7 +146,7 @@ class PublishFlow:
         except Exception:
             pass
         await self.s.snapshot(f"publish-{what}")
-        raise PublishError(f"Could not fill {what} ({selector}).")
+        raise PublishError(f"{what} sahəsi doldurula bilmədi.")
 
     async def _fill_textarea(self, value: str):
         """Description is a textarea wrapped in a role=button container; click
@@ -154,7 +159,7 @@ class PublishFlow:
             await ta.type(str(value), delay=15)
         except Exception as exc:
             await self.s.snapshot("publish-description")
-            raise PublishError(f"Could not fill description: {exc}") from exc
+            raise PublishError(f"Təsvir sahəsi doldurula bilmədi: {exc}") from exc
 
     async def _click_text(self, text: str, what: str):
         """Click an element by its exact visible text (for options/categories)."""
@@ -162,7 +167,7 @@ class PublishFlow:
             await self.page.get_by_text(text, exact=True).first.click(timeout=6000)
         except Exception as exc:
             await self.s.snapshot(f"publish-{what}")
-            raise PublishError(f"Could not click '{text}' for {what}.") from exc
+            raise PublishError(f"'{text}' ({what}) seçilə bilmədi.") from exc
 
     # -------------------------------------------------------------- steps
     async def open_new_ad(self):
@@ -171,7 +176,7 @@ class PublishFlow:
         await asyncio.sleep(1.5)
         low = self.page.url.lower()
         if "login" in low or "hello.bina.az" in low:
-            raise PublishError("Not logged in — the new-ad page redirected to login.")
+            raise PublishError("Giriş edilməyib — yeni elan səhifəsi giriş səhifəsinə yönləndirdi.")
 
     async def fetch_my_ads(self) -> list[dict]:
         """Read the user's listings from /profile/items, across ALL status tabs.
@@ -186,7 +191,7 @@ class PublishFlow:
         await asyncio.sleep(2.5)
         low = self.page.url.lower()
         if "login" in low or "hello.bina.az" in low or "authentication" in low:
-            raise PublishError("Not logged in — profile redirected to login.")
+            raise PublishError("Giriş edilməyib — profil giriş səhifəsinə yönləndirdi.")
         # Even without a redirect, a visible 'Giriş' header button (and no
         # profile avatar) means we're logged out — don't report "no ads".
         try:
@@ -195,7 +200,7 @@ class PublishFlow:
             # the signal — don't match on text.
             giris = self.page.locator("button[data-cy='header-profile-btn']").first
             if await giris.count() and await giris.is_visible(timeout=1500):
-                raise PublishError("Not logged in — please log in first.")
+                raise PublishError("Giriş edilməyib — əvvəlcə daxil olun.")
         except PublishError:
             raise
         except Exception:
@@ -312,8 +317,15 @@ class PublishFlow:
         await self._click(PUB[opener_key], f"open-{tag}")
         await asyncio.sleep(0.8)
 
+        # Type into THIS field's own search box (not whichever one is last on
+        # the page) so a district name can never land in the city field.
+        scoped = {"city": "search_city", "district": "search_district",
+                  "village": "search_village"}.get(tag)
+        box_sel = PUB.get(scoped) or PUB["search_input"]
         try:
-            box = self.page.locator(PUB["search_input"]).last
+            box = self.page.locator(box_sel).first
+            if not await box.count():
+                box = self.page.locator(PUB["search_input"]).last
             await box.wait_for(state="visible", timeout=4000)
             await box.click()
             await box.fill("")
@@ -364,12 +376,11 @@ class PublishFlow:
                 pass
         if not clicked:
             await self.s.snapshot(f"publish-pick-{tag}")
-            raise PublishError(f"Couldn't click '{text}' in the {tag} list.")
-        await asyncio.sleep(1.0)
-        # Close the overlay so the next dropdown opener (e.g. district) is
-        # clickable and not covered by this list.
-        await self._close_overlay()
-        await asyncio.sleep(0.5)
+            raise PublishError(f"'{text}' ({tag}) siyahısından seçilə bilmədi.")
+        # Do NOT press Escape here. The dropdown closes itself on selection,
+        # and Escape CANCELS the choice — that is what left the city field
+        # empty and stopped the Rayon field from ever appearing.
+        await asyncio.sleep(1.2)
 
     async def open_map_and_confirm(self):
         """Click 'Xəritədə göstər' and confirm the map popup (#4).
@@ -507,7 +518,7 @@ class PublishFlow:
             await asyncio.sleep(2.0)
         except Exception as exc:
             await self.s.snapshot("publish-photos")
-            raise PublishError(f"Photo upload failed: {exc}") from exc
+            raise PublishError(f"Şəkil yüklənmədi: {exc}") from exc
 
     async def fill_contact(self, *, name=None, email=None, is_owner=True):
         # contact tab
