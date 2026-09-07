@@ -71,12 +71,13 @@ class AskBroker:
         p.future.set_result(value)
         return True
 
-    def feed_photo(self, chat_id: int, file_path: str) -> bool:
+    def feed_photo(self, chat_id: int, file_path: str) -> int:
+        """Store a photo; returns the running count (0 if not collecting)."""
         p = self._pending.get(chat_id)
         if not p or p.future.done() or p.kind != "photos":
-            return False
+            return 0
         p.photos.append(file_path)
-        return True
+        return len(p.photos)
 
     def feed_photos_done(self, chat_id: int) -> bool:
         p = self._pending.get(chat_id)

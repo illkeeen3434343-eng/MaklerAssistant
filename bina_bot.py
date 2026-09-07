@@ -16,6 +16,7 @@ Requires (in .env or the environment):
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import contextvars
 import logging
 import os
@@ -248,6 +249,19 @@ def admin_menu() -> ReplyKeyboardMarkup:
 
 
 # Tracks each user's currently-active bina.az number.
+
+def _safe(text) -> str:
+    """Escape text for Telegram HTML parse_mode.
+
+    Playwright errors embed raw markup (e.g. <textarea ...>), which Telegram
+    rejects with "can't parse entities" — that killed the handler mid-wizard.
+    Also trim: full tracebacks exceed Telegram's message limit.
+    """
+    t = str(text).strip()
+    if len(t) > 600:
+        t = t[:600] + " …"
+    return _html.escape(t)
+
 _active_number: dict[int, str] = {}
 # which admin action was requested before tapping a /id  (#3)
 _admin_intent: dict[int, str] = {}
@@ -421,10 +435,15 @@ async def wizard_photo(msg: Message, bot: Bot, state: FSMContext):
     path = str(Path(tempfile.gettempdir()) / f"binaphoto_{photo.file_unique_id}.jpg")
     try:
         await bot.download(photo, destination=path)
-        ask.feed_photo(msg.chat.id, path)
-        await msg.answer("📷 Minimum 4, maksimum 30 ədəd şəkil yükləyin.\n")
+        n = ask.feed_photo(msg.chat.id, path)
+        # Do NOT repeat the instructions for every photo — Telegram sends one
+        # update per image, which spammed the chat. Acknowledge quietly with a
+        # running count, and only on a media-group boundary.
+        if isinstance(n, int) and n and n % 4 == 0:
+            await msg.answer(f"📷 {n} şəkil alındı. "
+                             f"Bitirdikdə ✅ düyməsinə basın.")
     except Exception as exc:
-        await msg.answer(f"şəkli saxlaya bilmədim: {exc}")
+        await msg.answer(f"şəkli saxlaya bilmədim: {_safe(exc)}")
 
 
 MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_SESSIONS, BTN_ADMIN,
@@ -1155,7 +1174,7 @@ async def kb_new(msg: Message, bot: Bot, state: FSMContext):
         except Cancelled:
             await bot.send_message(msg.chat.id, "🛑 Elan yerləşdirmə ləğv edildi.", reply_markup=main_menu())
         except PublishError as exc:
-            await bot.send_message(msg.chat.id, f"❌ {exc}", reply_markup=main_menu())
+            await bot.send_message(msg.chat.id, f"❌ {_safe(exc)}", reply_markup=main_menu())
         except asyncio.TimeoutError:
             await bot.send_message(msg.chat.id, "⏰ Cavab gözləmə müddəti bitdi.", reply_markup=main_menu())
         except Exception as exc:
@@ -1385,8 +1404,7 @@ async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
     options = list(known) if known else await flow.search_and_pick(opener_key, "", tag=tag)
     if not options:
         if optional:
-            await bot.send_message(chat_id, f"{label}: variant tapılmadı — keçilir.")
-            return None
+            return None          # optional field (e.g. Qəsəbə) -> skip silently
         raise PublishError(f"{label}: variant tapılmadı.")
 
     page = 0
@@ -1467,16 +1485,15 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                 await _select_on_page(bot, chat_id, flow, "district_button",
                                       "Rayon", district, tag="district",
                                       already_open=True)
-            # Qəsəbə is optional and often absent — only try it if the opener
-            # actually exists, otherwise it raises a confusing click error.
+            # Qəsəbə (settlement) is NOT mandatory on bina.az. If the field
+            # is absent, or anything about it fails, skip it silently and
+            # carry on with the rest of the listing.
             try:
-                has_village = await flow.page.locator(
-                    PUB_VILLAGE).first.count() > 0
+                if await flow.page.locator(PUB_VILLAGE).first.count():
+                    await _pick_list(bot, chat_id, flow, "village_button",
+                                     "Qəsəbə", tag="village", optional=True)
             except Exception:
-                has_village = False
-            if has_village:
-                await _pick_list(bot, chat_id, flow, "village_button",
-                                 "Qəsəbə", tag="village", optional=True)
+                pass
 
         address = await ask.ask_text(bot, chat_id,
                                      "Ünvanı daxil edin:")
@@ -1506,14 +1523,13 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                                 total_floors=total, description=desc, price=price)
 
         # optional checkboxes
-        extras = await ask.ask_choice(bot, chat_id, "Bunlardan hansı var?",
+        extras = await ask.ask_choice(bot, chat_id, "Bunlardan hər hansı biri varmı?",
                                       [("Çıxarış var", "bill"),
                                        ("İpoteka var", "mortgage"),
-                                       ("Hər ikisi", "both"),
                                        ("Heç biri", "none")])
-        if extras in ("bill", "both"):
+        if extras == "bill":
             await flow.set_checkbox("bill_of_sale", True)
-        if extras in ("mortgage", "both"):
+        elif extras == "mortgage":
             await flow.set_checkbox("mortgage", True)
 
         # photos (min 4, max 30)
@@ -1540,18 +1556,12 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.fill_contact(name=name, email=email, is_owner=is_owner)
 
         # review + submit
-        extras_az = {"bill": "Çıxarış var", "mortgage": "İpoteka var",
-                     "both": "Çıxarış və İpoteka var",
-                     "none": "Yoxdur"}.get(extras, "Yoxdur")
         summary = (f"<b>Yoxlama</b>\n"
-                   f"• Əmlakın növü: {cat} · Satıram\n"
-                   f"• Yer: {city}\n"
-                   f"• Otaq sayı: {rooms} · Sahə: {area} m² · "
-                   f"Mərtəbə: {floor}/{total}\n"
-                   f"• Təmir: {repair} · Qiymət: {price} AZN\n"
-                   f"• Sənəd: {extras_az}\n"
-                   f"• Şəkil sayı: {len(photos)}\n\n"
-                   f"Elanı göndərmək üçün <b>Davam etmək</b> düyməsinə basın.")
+                   f"• {cat} · Sell\n"
+                   f"• {city} · {rooms} rooms · {area} m² · floor {floor}/{total}\n"
+                   f"• Repair: {repair} · Price: {price} AZN\n"
+                   f"• {len(photos)} photos\n\n"
+                   f"Tap Continue to submit (bina.az may then show a package step).")
         go = await ask.ask_choice(bot, chat_id, summary,
                                   [("▶️ Davam etmək", "go")])
         if go != "go":
@@ -1562,8 +1572,8 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
     await bot.send_message(
         chat_id,
         "✅ <b>Elan göndərildi!</b>\n\n"
-        "Elanınız yoxlama üçün bina.az-a göndərildi. Moderatorlar təsdiq "
-        "etdikdən sonra saytda dərc olunacaq.\n\n"
+        "Your ad has been sent to bina.az for review. Once their moderators "
+        "approve it, it goes live on the site.\n\n"
         "Statusu istənilən vaxt 📋 Elanlarım ilə yoxlayın.",
         reply_markup=main_menu())
 
@@ -1610,7 +1620,7 @@ async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str,
             await bot.send_message(chat_id, "⏰ Kodu vaxtında daxil etmədiniz.", reply_markup=main_menu())
             return False
         except LoginError as exc:
-            await bot.send_message(chat_id, f"❌ {exc}", reply_markup=main_menu())
+            await bot.send_message(chat_id, f"❌ {_safe(exc)}", reply_markup=main_menu())
             return False
         except Exception as exc:
             log.exception("login error")

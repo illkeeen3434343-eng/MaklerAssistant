@@ -149,17 +149,49 @@ class PublishFlow:
         raise PublishError(f"{what} sahəsi doldurula bilmədi.")
 
     async def _fill_textarea(self, value: str):
-        """Description is a textarea wrapped in a role=button container; click
-        the wrapper first, then type into the textarea by data-cy."""
+        """Description is a textarea wrapped in a role=button container.
+
+        IMPORTANT: do NOT use type() here. A typical listing description is
+        700+ characters and type(delay=15) takes 11+ seconds, which blows past
+        Playwright's action timeout. fill() sets the value in one step and
+        still fires the input event React needs.
+        """
+        value = str(value)
         try:
             wrap = self.page.locator("[data-cy='text-area-container']").first
-            await wrap.click()
-            ta = self.page.locator("[data-cy='text-area-input'], textarea[name='description']").first
-            await ta.fill("")
-            await ta.type(str(value), delay=15)
-        except Exception as exc:
-            await self.s.snapshot("publish-description")
-            raise PublishError(f"Təsvir sahəsi doldurula bilmədi: {exc}") from exc
+            if await wrap.count():
+                await wrap.click(timeout=5000)
+        except Exception:
+            pass
+
+        ta = self.page.locator(
+            "[data-cy='text-area-input'], textarea[name='description']").first
+        try:
+            await ta.wait_for(state="visible", timeout=8000)
+            await ta.fill(value, timeout=15000)
+        except Exception:
+            # JS fallback: set the value and fire React's input/change events
+            try:
+                await ta.evaluate(
+                    """(el, text) => {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value').set;
+                        setter.call(el, text);
+                        el.dispatchEvent(new Event('input',  {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    }""", value)
+            except Exception as exc:
+                await self.s.snapshot("publish-description")
+                raise PublishError(
+                    "Təsvir sahəsi doldurula bilmədi.") from exc
+
+        # verify it actually landed
+        try:
+            got = (await ta.input_value()) or ""
+            if got.strip()[:40] != value.strip()[:40]:
+                await self.s.snapshot("publish-description")
+        except Exception:
+            pass
 
     async def _click_text(self, text: str, what: str):
         """Click an element by its exact visible text (for options/categories)."""
@@ -471,23 +503,30 @@ class PublishFlow:
           modal  : <div id="item-form-map-modal"> … </div>
           save   : <button data-cy="map-modal-save-btn">Yadda saxla</button>
 
-        The modal centres the pin on the selected district automatically, so
-        clicking 'Yadda saxla' is all that is required.
+        The modal already centres the pin on the chosen district, so opening it
+        and clicking 'Yadda saxla' is all that's needed.
         """
-        try:
-            btn = self.page.locator("[data-cy='new-ad-select-on-map']").first
-            if not await btn.count():
-                # the whole map block may be missing for some categories
-                return False
-            await btn.scroll_into_view_if_needed(timeout=4000)
-            await btn.click(timeout=5000)
-        except Exception:
+        opened = False
+        for sel in ("[data-cy='new-ad-select-on-map']", "[data-cy='item-form-map']"):
+            try:
+                btn = self.page.locator(sel).first
+                if not await btn.count():
+                    continue
+                await btn.scroll_into_view_if_needed(timeout=4000)
+                try:
+                    await btn.click(timeout=5000)
+                except Exception:
+                    await btn.click(timeout=4000, force=True)
+                opened = True
+                break
+            except Exception:
+                continue
+        if not opened:
             await self.s.snapshot("publish-map-open-fail")
             return False
 
-        # wait for the map modal to actually render
         modal = self.page.locator("#item-form-map-modal")
-        for _ in range(20):                      # up to ~10s (map tiles load)
+        for _ in range(24):                      # up to ~12s (map tiles load)
             await asyncio.sleep(0.5)
             try:
                 if await modal.count():
@@ -498,18 +537,20 @@ class PublishFlow:
             await self.s.snapshot("publish-map-nomodal")
             return False
 
-        await asyncio.sleep(1.5)                 # let the pin settle
+        await asyncio.sleep(2.0)                 # let the pin/tiles settle
 
         try:
             save = self.page.locator("[data-cy='map-modal-save-btn']").first
-            await save.wait_for(state="visible", timeout=6000)
-            await save.click(timeout=5000)
+            await save.wait_for(state="visible", timeout=8000)
+            try:
+                await save.click(timeout=5000)
+            except Exception:
+                await save.click(timeout=4000, force=True)
         except Exception:
             await self.s.snapshot("publish-map-nosave")
             return False
 
-        # confirm the modal closed
-        for _ in range(10):
+        for _ in range(12):                      # confirm the modal closed
             await asyncio.sleep(0.4)
             try:
                 if not await modal.count():
