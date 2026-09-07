@@ -51,7 +51,18 @@ class AskBroker:
         if p.kind in ("text", "choice"):
             p.future.set_result(text)
             return True
+        if p.kind == "message":
+            p.future.set_result(("text", text, ""))
+            return True
         return False
+
+    def feed_message_photo(self, chat_id: int, file_id: str,
+                           caption: str = "") -> bool:
+        p = self._pending.get(chat_id)
+        if not p or p.future.done() or p.kind != "message":
+            return False
+        p.future.set_result(("photo", file_id, caption or ""))
+        return True
 
     def feed_choice(self, chat_id: int, value: str) -> bool:
         p = self._pending.get(chat_id)
@@ -108,6 +119,22 @@ class AskBroker:
         self._pending[chat_id] = _Pending(kind)
         try:
             return await asyncio.wait_for(self._pending[chat_id].future, timeout)
+        finally:
+            self._pending.pop(chat_id, None)
+
+    async def ask_message(self, bot: Bot, chat_id: int,
+                          timeout: float = 300.0):
+        """Wait for the next message (text OR photo).
+
+        Returns ("text", text, "") or ("photo", file_id, caption), or None
+        if cancelled/timed out.
+        """
+        p = _Pending("message")
+        self._pending[chat_id] = p
+        try:
+            return await asyncio.wait_for(p.future, timeout=timeout)
+        except (Cancelled, asyncio.TimeoutError):
+            return None
         finally:
             self._pending.pop(chat_id, None)
 

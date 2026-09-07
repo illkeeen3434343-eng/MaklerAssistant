@@ -169,6 +169,54 @@ def add_number(user_id: int, phone: str) -> tuple[bool, str]:
     return True, "added"
 
 
+def set_expiry(user_id: int, iso_date: str | None) -> None:
+    """Set/clear the subscription expiry date (YYYY-MM-DD)."""
+    data = _load(); uid = str(user_id)
+    if uid in data:
+        data[uid]["expires_at"] = iso_date
+        data[uid]["expiry_warned"] = False      # re-arm the 3-day reminder
+        _save(data)
+
+
+def expiry_of(user_id: int) -> str | None:
+    return (_load().get(str(user_id)) or {}).get("expires_at")
+
+
+def mark_expiry_warned(user_id: int) -> None:
+    data = _load(); uid = str(user_id)
+    if uid in data:
+        data[uid]["expiry_warned"] = True
+        _save(data)
+
+
+def subscriptions_due(warn_days: int = 3) -> tuple[list, list]:
+    """Return (expiring_soon, expired).
+
+    expiring_soon: active users whose subscription ends within `warn_days`
+                   and who have not been warned yet.
+    expired:       active users whose expiry date has passed.
+    """
+    from datetime import date
+    today = date.today()
+    soon, gone = [], []
+    for uid, r in _load().items():
+        if r.get("status") != "active":
+            continue
+        exp = r.get("expires_at")
+        if not exp:
+            continue
+        try:
+            d = date.fromisoformat(exp)
+        except Exception:
+            continue
+        left = (d - today).days
+        if left < 0:
+            gone.append((int(uid), exp))
+        elif left <= warn_days and not r.get("expiry_warned"):
+            soon.append((int(uid), exp, left))
+    return soon, gone
+
+
 def remove_number(user_id: int, phone: str) -> None:
     d = _digits(phone)
     data = _load(); uid = str(user_id)

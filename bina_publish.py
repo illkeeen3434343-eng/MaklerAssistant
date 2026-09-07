@@ -294,6 +294,71 @@ class PublishFlow:
     OPTION_ROW = "label[data-cy='radio-container']"
     OPTION_TEXT = "[data-cy='city']"          # the label text span (same for all 3)
 
+    async def type_in_open(self, tag: str, query: str) -> list[str]:
+        """Type into an ALREADY-OPEN dropdown's own search box and read options.
+
+        Used for the Rayon list after open_district() has confirmed that
+        item-form-find-region exists, so we can never touch the city box.
+        """
+        sel = {"city": "search_city", "district": "search_district",
+               "village": "search_village"}.get(tag)
+        try:
+            box = self.page.locator(PUB[sel]).first
+            await box.wait_for(state="visible", timeout=4000)
+            await box.click()
+            await box.fill("")
+            if query:
+                await box.type(query, delay=60)
+            await asyncio.sleep(1.0)
+        except Exception:
+            await self.s.snapshot(f"publish-{tag}-typefail")
+            return []
+        results: list[str] = []
+        for _ in range(12):
+            await asyncio.sleep(0.4)
+            results = await self.page.evaluate(
+                """(sel) => Array.from(document.querySelectorAll(sel))
+                       .filter(el => el.getClientRects().length)
+                       .map(el => (el.textContent || '').trim())
+                       .filter(Boolean)""",
+                self.OPTION_TEXT,
+            )
+            if results:
+                break
+        await self.s.snapshot(f"publish-{tag}-open")
+        return results
+
+    async def current_city(self) -> str:
+        """The city already shown in the form (bina.az defaults to 'Bakı').
+
+        The city input is rendered readonly with its selected value, e.g.
+        <input data-cy="search-input" readonly value="Bakı">. If it already
+        holds the city we want, the whole city step can be skipped.
+        """
+        try:
+            box = self.page.locator(PUB["search_city"]).first
+            if await box.count():
+                return ((await box.input_value()) or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    async def open_district(self) -> bool:
+        """Open the Rayon dropdown and confirm its own search box appeared."""
+        try:
+            await self._click(PUB["district_button"], "open-district")
+        except PublishError:
+            return False
+        for _ in range(12):                       # up to ~6s
+            await asyncio.sleep(0.5)
+            try:
+                if await self.page.locator(PUB["search_district"]).count():
+                    return True
+            except Exception:
+                pass
+        await self.s.snapshot("publish-district-noopen")
+        return False
+
     async def search_and_pick(self, opener_key: str, query: str, tag: str) -> list[str]:
         """Open a search-dropdown, type `query`, return the option label texts.
 
@@ -317,23 +382,34 @@ class PublishFlow:
         await self._click(PUB[opener_key], f"open-{tag}")
         await asyncio.sleep(0.8)
 
-        # Type into THIS field's own search box (not whichever one is last on
-        # the page) so a district name can never land in the city field.
+        # Type into THIS field's own search box. For district/village we must
+        # NEVER fall back to a global lookup: the only search box on the page
+        # when their dropdown fails to open is the CITY one, and typing a
+        # district name there overwrites the city (that was the bug).
         scoped = {"city": "search_city", "district": "search_district",
                   "village": "search_village"}.get(tag)
         box_sel = PUB.get(scoped) or PUB["search_input"]
+        typed = False
         try:
             box = self.page.locator(box_sel).first
             if not await box.count():
-                box = self.page.locator(PUB["search_input"]).last
+                if tag == "city":
+                    box = self.page.locator(PUB["search_input"]).last
+                else:
+                    # district/village box missing -> dropdown didn't open.
+                    await self.s.snapshot(f"publish-{tag}-noinput")
+                    return []
             await box.wait_for(state="visible", timeout=4000)
             await box.click()
             await box.fill("")
             if query:
                 await box.type(query, delay=60)
+            typed = True
             await asyncio.sleep(1.0)
         except Exception:
-            pass
+            if tag != "city" and not typed:
+                await self.s.snapshot(f"publish-{tag}-noinput")
+                return []
 
         results: list[str] = []
         for _ in range(15):               # poll up to ~6s for options to render

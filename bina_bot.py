@@ -407,6 +407,11 @@ async def wizard_photo(msg: Message, bot: Bot, state: FSMContext):
     if await state.get_state() == Flow.report.state:
         await _handle_report_photo(msg, state, bot)
         return
+    # admin composing a message to a user (text OR photo)
+    if ask.waiting_kind(msg.chat.id) == "message":
+        ask.feed_message_photo(msg.chat.id, msg.photo[-1].file_id,
+                               msg.caption or "")
+        return
     if ask.waiting_kind(msg.chat.id) != "photos":
         return
     # download the largest size to a temp file, hand the path to the broker
@@ -886,6 +891,10 @@ async def admin_pick_user(msg: Message, bot: Bot):
                               f"ℹ️ Admin statusunuzu dəyişdi: <b>{az}</b>."
                               + ("\n\nArtıq botdan istifadə edə bilərsiniz. /start"
                                  if val == "active" else ""))
+                if val == "active":
+                    await _ask_expiry(bot, chat_id, target)
+                else:
+                    U.set_expiry(target, None)
             elif kind == "ti":
                 U.set_tier(target, val)
                 cap = U.TIERS[val]["max_numbers"]
@@ -894,6 +903,7 @@ async def admin_pick_user(msg: Message, bot: Bot):
                 await _notify(bot, target,
                               f"⭐ Tarifiniz dəyişdirildi: <b>{val}</b> "
                               f"({cap} nömrə).")
+                await _ask_expiry(bot, chat_id, target)
         except Cancelled:
             await bot.send_message(chat_id, "Ləğv edildi.", reply_markup=admin_menu())
         except asyncio.TimeoutError:
@@ -950,16 +960,99 @@ async def _admin_manage_numbers(bot: Bot, chat_id: int, target: int):
                       f"📱 Admin {mask(chosen)} nömrəsini hesabınızdan ayırdı.")
 
 
+async def _ask_expiry(bot: Bot, chat_id: int, target: int):
+    """#1 — after approving/upgrading, record when the subscription ends."""
+    from datetime import date, timedelta
+    today = date.today()
+    opts = [
+        ("1 ay", (today + timedelta(days=30)).isoformat()),
+        ("3 ay", (today + timedelta(days=90)).isoformat()),
+        ("6 ay", (today + timedelta(days=180)).isoformat()),
+        ("1 il", (today + timedelta(days=365)).isoformat()),
+        ("📅 Tarix yazım", "manual"),
+        ("Müddətsiz", "none"),
+    ]
+    try:
+        choice = await ask.ask_choice(
+            bot, chat_id,
+            f"{U.label_for(target)} — abunə nə vaxt bitir?", opts)
+    except Exception:
+        return
+    if choice == "none":
+        U.set_expiry(target, None)
+        await bot.send_message(chat_id, "♾ Müddətsiz olaraq qeyd edildi.",
+                               reply_markup=admin_menu())
+        return
+    if choice == "manual":
+        raw = (await ask.ask_text(
+            bot, chat_id, "Bitmə tarixini yazın (<b>YYYY-MM-DD</b>):")).strip()
+        try:
+            date.fromisoformat(raw)
+        except Exception:
+            await bot.send_message(chat_id, "⚠️ Tarix formatı yanlışdır.",
+                                   reply_markup=admin_menu())
+            return
+        choice = raw
+    U.set_expiry(target, choice)
+    await bot.send_message(chat_id,
+                           f"📅 Abunə bitmə tarixi: <b>{choice}</b>",
+                           reply_markup=admin_menu())
+    await _notify(bot, target, f"📅 Abunəniz <b>{choice}</b> tarixinədək aktivdir.")
+
+
+async def subscription_watcher(bot: Bot):
+    """Daily: warn 3 days before expiry, and downgrade on expiry (#1)."""
+    while True:
+        try:
+            soon, gone = U.subscriptions_due(warn_days=3)
+            for uid, exp, left in soon:
+                gun = "bu gün" if left == 0 else f"{left} gün sonra"
+                await _notify(bot, uid,
+                    f"⏳ <b>Abunə bitmək üzrədir</b>\n"
+                    f"Abunəniz {gun} ({exp}) başa çatır.\n"
+                    f"Davam etmək üçün admin ilə əlaqə saxlayın (✉️ Əlaqə).")
+                await notify_admins(bot,
+                    f"⏳ <b>Abunə bitir</b>\n{U.label_for(uid)}\n"
+                    f"Tarix: {exp} ({gun}). Ödəniş alındıqda tarixi yeniləyin.")
+                U.mark_expiry_warned(uid)
+            for uid, exp in gone:
+                U.set_status(uid, "pending")
+                U.set_expiry(uid, None)
+                await _notify(bot, uid,
+                    f"🔒 <b>Abunəniz bitdi</b> ({exp}).\n"
+                    f"Hesabınız təsdiq gözləmə rejiminə keçirildi. "
+                    f"Yeniləmək üçün ✉️ Əlaqə ilə admin ilə danışın.")
+                await notify_admins(bot,
+                    f"🔒 <b>Abunə bitdi</b>\n{U.label_for(uid)} ({exp})\n"
+                    f"Status avtomatik <b>gözləmədə</b> edildi.")
+        except Exception as exc:
+            _log(f"subscription watcher error: {exc}")
+        await asyncio.sleep(6 * 3600)     # check 4x/day
+
+
 async def _admin_message_user(bot: Bot, chat_id: int, target: int):
-    """#4 — admin sends a direct message to a user."""
-    text = (await ask.ask_text(
-        bot, chat_id,
-        f"{U.label_for(target)} istifadəçisinə göndəriləcək mesajı yazın:")).strip()
-    if not text:
+    """#4 — admin sends a direct message (text OR photo) to a user."""
+    await bot.send_message(
+        chat_id,
+        f"{U.label_for(target)} istifadəçisinə göndəriləcək mesajı yazın "
+        f"— <b>şəkil də göndərə bilərsiniz</b>.")
+    got = await ask.ask_message(bot, chat_id)      # text or photo
+    if got is None:
         await bot.send_message(chat_id, "Boş mesaj göndərilmədi.",
                                reply_markup=admin_menu())
         return
-    ok = await _notify(bot, target, f"✉️ <b>Admindən mesaj</b>\n\n{text}")
+    kind, payload, caption = got
+    ok = False
+    try:
+        if kind == "photo":
+            await bot.send_photo(
+                target, payload,
+                caption=f"✉️ <b>Admindən mesaj</b>\n\n{caption}"[:1024])
+        else:
+            await bot.send_message(target, f"✉️ <b>Admindən mesaj</b>\n\n{payload}")
+        ok = True
+    except Exception:
+        ok = False
     await bot.send_message(
         chat_id,
         "✅ Göndərildi." if ok else "⚠️ İstifadəçiyə çatdırıla bilmədi "
@@ -1243,6 +1336,42 @@ async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
     return chosen_text
 
 
+async def _ask_from_list(bot, chat_id, label, options, page_size=5):
+    """Ask the user to pick from a known list of names (buttons only)."""
+    page = 0
+    while True:
+        chunk = options[page * page_size:(page + 1) * page_size]
+        opts = [(r[:40], f"r{page*page_size+i}") for i, r in enumerate(chunk)]
+        if (page + 1) * page_size < len(options):
+            opts.append(("➡️ Digər", "more"))
+        chosen = await ask.ask_choice(bot, chat_id, f"{label}:", opts)
+        if chosen == "more":
+            page += 1
+            continue
+        return options[int(chosen[1:])]
+
+
+async def _select_on_page(bot, chat_id, flow, opener_key, label, pick, tag,
+                          already_open=False, optional=False):
+    """Type `pick` into that field's own dropdown and click the matching row."""
+    try:
+        if already_open:
+            results = await flow.type_in_open(tag, pick)
+        else:
+            results = await flow.search_and_pick(opener_key, pick, tag=tag)
+        target = pick if pick in results else (results[0] if results else None)
+        if target:
+            await flow.pick_result(target, tag=tag)
+            return pick
+        if not optional:
+            await bot.send_message(
+                chat_id, f"⚠️ {label}: '{pick}' səhifədə tapılmadı.")
+    except PublishError:
+        if not optional:
+            await bot.send_message(chat_id, f"⚠️ {label}: '{pick}' seçilə bilmədi.")
+    return pick
+
+
 async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
                      known=None, optional=False, page_size=5):
     """Show the option buttons (from a known list), then select on the page.
@@ -1313,16 +1442,30 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         is_owner = False          # default: agent (Mən vasitəçiyəm)
         await flow.choose_owner(is_owner)
 
-        # City — buttons from the known list; typed onto the page to select.
-        city = await _pick_list(bot, chat_id, flow, "city_button", "Şəhər",
-                                tag="city", known=CITIES)
+        # City — ask which city, but SKIP touching the page when bina.az has
+        # already selected it (the form defaults to Bakı, readonly). Re-typing
+        # it was what left the field in a broken state.
+        city = await _ask_from_list(bot, chat_id, "Şəhər", CITIES)
+        already = (await flow.current_city()).strip()
+        if already and already.casefold() == (city or "").casefold():
+            await bot.send_message(chat_id, f"🏙 Şəhər artıq seçilib: <b>{already}</b>")
+        else:
+            await _select_on_page(bot, chat_id, flow, "city_button", "Şəhər",
+                                  city, tag="city")
 
         # Rayon (district): ONLY for Bakı, and it shows DISTRICT names, not cities.
         if (city or "").strip().lower() in ("bakı", "baki", "baku"):
-            await _pick_list(bot, chat_id, flow, "district_button",
-                             "Rayon", tag="district",
-                             known=BAKU_DISTRICTS, optional=True,
-                             page_size=len(BAKU_DISTRICTS))
+            district = await _ask_from_list(bot, chat_id, "Rayon",
+                                            BAKU_DISTRICTS,
+                                            page_size=len(BAKU_DISTRICTS))
+            if not await flow.open_district():
+                await bot.send_message(
+                    chat_id, "⚠️ Rayon siyahısı açılmadı. /debug yazıb "
+                             "publish-district-noopen.html göndərin.")
+            else:
+                await _select_on_page(bot, chat_id, flow, "district_button",
+                                      "Rayon", district, tag="district",
+                                      already_open=True)
             await _pick_list(bot, chat_id, flow, "village_button",
                              "Qəsəbə", tag="village", optional=True)
 
@@ -1496,6 +1639,7 @@ async def main():
     log.info("MaklerAssistant starting. Allowed: %s", ALLOWED)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        asyncio.create_task(subscription_watcher(bot))
         await dp.start_polling(bot)
     finally:
         for s in _sessions.values():
