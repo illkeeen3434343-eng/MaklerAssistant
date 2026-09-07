@@ -1385,7 +1385,8 @@ async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
     options = list(known) if known else await flow.search_and_pick(opener_key, "", tag=tag)
     if not options:
         if optional:
-            return None          # optional field (e.g. Qəsəbə) -> skip silently
+            await bot.send_message(chat_id, f"{label}: variant tapılmadı — keçilir.")
+            return None
         raise PublishError(f"{label}: variant tapılmadı.")
 
     page = 0
@@ -1466,15 +1467,16 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                 await _select_on_page(bot, chat_id, flow, "district_button",
                                       "Rayon", district, tag="district",
                                       already_open=True)
-            # Qəsəbə (settlement) is NOT mandatory on bina.az. If the field
-            # is absent, or anything about it fails, skip it silently and
-            # carry on with the rest of the listing.
+            # Qəsəbə is optional and often absent — only try it if the opener
+            # actually exists, otherwise it raises a confusing click error.
             try:
-                if await flow.page.locator(PUB_VILLAGE).first.count():
-                    await _pick_list(bot, chat_id, flow, "village_button",
-                                     "Qəsəbə", tag="village", optional=True)
+                has_village = await flow.page.locator(
+                    PUB_VILLAGE).first.count() > 0
             except Exception:
-                pass
+                has_village = False
+            if has_village:
+                await _pick_list(bot, chat_id, flow, "village_button",
+                                 "Qəsəbə", tag="village", optional=True)
 
         address = await ask.ask_text(bot, chat_id,
                                      "Ünvanı daxil edin:")
@@ -1504,13 +1506,14 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                                 total_floors=total, description=desc, price=price)
 
         # optional checkboxes
-        extras = await ask.ask_choice(bot, chat_id, "Bunlardan hər hansı biri varmı?",
+        extras = await ask.ask_choice(bot, chat_id, "Bunlardan hansı var?",
                                       [("Çıxarış var", "bill"),
                                        ("İpoteka var", "mortgage"),
+                                       ("Hər ikisi", "both"),
                                        ("Heç biri", "none")])
-        if extras == "bill":
+        if extras in ("bill", "both"):
             await flow.set_checkbox("bill_of_sale", True)
-        elif extras == "mortgage":
+        if extras in ("mortgage", "both"):
             await flow.set_checkbox("mortgage", True)
 
         # photos (min 4, max 30)
@@ -1537,12 +1540,18 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.fill_contact(name=name, email=email, is_owner=is_owner)
 
         # review + submit
+        extras_az = {"bill": "Çıxarış var", "mortgage": "İpoteka var",
+                     "both": "Çıxarış və İpoteka var",
+                     "none": "Yoxdur"}.get(extras, "Yoxdur")
         summary = (f"<b>Yoxlama</b>\n"
-                   f"• {cat} · Sell\n"
-                   f"• {city} · {rooms} rooms · {area} m² · floor {floor}/{total}\n"
-                   f"• Repair: {repair} · Price: {price} AZN\n"
-                   f"• {len(photos)} photos\n\n"
-                   f"Tap Continue to submit (bina.az may then show a package step).")
+                   f"• Əmlakın növü: {cat} · Satıram\n"
+                   f"• Yer: {city}\n"
+                   f"• Otaq sayı: {rooms} · Sahə: {area} m² · "
+                   f"Mərtəbə: {floor}/{total}\n"
+                   f"• Təmir: {repair} · Qiymət: {price} AZN\n"
+                   f"• Sənəd: {extras_az}\n"
+                   f"• Şəkil sayı: {len(photos)}\n\n"
+                   f"Elanı göndərmək üçün <b>Davam etmək</b> düyməsinə basın.")
         go = await ask.ask_choice(bot, chat_id, summary,
                                   [("▶️ Davam etmək", "go")])
         if go != "go":
@@ -1553,8 +1562,8 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
     await bot.send_message(
         chat_id,
         "✅ <b>Elan göndərildi!</b>\n\n"
-        "Your ad has been sent to bina.az for review. Once their moderators "
-        "approve it, it goes live on the site.\n\n"
+        "Elanınız yoxlama üçün bina.az-a göndərildi. Moderatorlar təsdiq "
+        "etdikdən sonra saytda dərc olunacaq.\n\n"
         "Statusu istənilən vaxt 📋 Elanlarım ilə yoxlayın.",
         reply_markup=main_menu())
 

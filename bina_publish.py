@@ -464,32 +464,59 @@ class PublishFlow:
         await asyncio.sleep(1.2)
 
     async def open_map_and_confirm(self):
-        """Click 'Xəritədə göstər' and confirm the map popup (#4).
+        """Pin the location on the map — MANDATORY for bina.az.
 
-        Selectors are best-effort; the map confirm button text varies. Failures
-        are non-fatal — the address text field already sets the location.
+        Confirmed markup:
+          opener : <button data-cy="new-ad-select-on-map">Xəritədə göstər</button>
+          modal  : <div id="item-form-map-modal"> … </div>
+          save   : <button data-cy="map-modal-save-btn">Yadda saxla</button>
+
+        The modal centres the pin on the selected district automatically, so
+        clicking 'Yadda saxla' is all that is required.
         """
         try:
             btn = self.page.locator("[data-cy='new-ad-select-on-map']").first
-            if await btn.count() and await btn.is_visible(timeout=2000):
-                await btn.click()
-                await asyncio.sleep(2.0)
-                # try common confirm buttons in the map popup
-                for sel in ["button:has-text('Təsdiq')", "button:has-text('OK')",
-                            "button:has-text('Seç')", "button:has-text('Hazır')",
-                            "[data-cy*='confirm']", "button[type='submit']"]:
-                    try:
-                        c = self.page.locator(sel).first
-                        if await c.count() and await c.is_visible(timeout=1500):
-                            await c.click()
-                            await asyncio.sleep(1.0)
-                            return True
-                    except Exception:
-                        continue
-                await self.s.snapshot("publish-map-open")
+            if not await btn.count():
+                # the whole map block may be missing for some categories
+                return False
+            await btn.scroll_into_view_if_needed(timeout=4000)
+            await btn.click(timeout=5000)
         except Exception:
-            pass
-        return False
+            await self.s.snapshot("publish-map-open-fail")
+            return False
+
+        # wait for the map modal to actually render
+        modal = self.page.locator("#item-form-map-modal")
+        for _ in range(20):                      # up to ~10s (map tiles load)
+            await asyncio.sleep(0.5)
+            try:
+                if await modal.count():
+                    break
+            except Exception:
+                pass
+        else:
+            await self.s.snapshot("publish-map-nomodal")
+            return False
+
+        await asyncio.sleep(1.5)                 # let the pin settle
+
+        try:
+            save = self.page.locator("[data-cy='map-modal-save-btn']").first
+            await save.wait_for(state="visible", timeout=6000)
+            await save.click(timeout=5000)
+        except Exception:
+            await self.s.snapshot("publish-map-nosave")
+            return False
+
+        # confirm the modal closed
+        for _ in range(10):
+            await asyncio.sleep(0.4)
+            try:
+                if not await modal.count():
+                    return True
+            except Exception:
+                return True
+        return True
 
     async def discover_options(self, opener_key: str, filter_text: str | None = None,
                                tag: str = "dropdown") -> list[str]:
