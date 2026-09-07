@@ -1385,8 +1385,7 @@ async def _pick_list(bot, chat_id, flow, opener_key, label, tag,
     options = list(known) if known else await flow.search_and_pick(opener_key, "", tag=tag)
     if not options:
         if optional:
-            await bot.send_message(chat_id, f"{label}: variant tapılmadı — keçilir.")
-            return None
+            return None          # optional field (e.g. Qəsəbə) -> skip silently
         raise PublishError(f"{label}: variant tapılmadı.")
 
     page = 0
@@ -1467,16 +1466,15 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                 await _select_on_page(bot, chat_id, flow, "district_button",
                                       "Rayon", district, tag="district",
                                       already_open=True)
-            # Qəsəbə is optional and often absent — only try it if the opener
-            # actually exists, otherwise it raises a confusing click error.
+            # Qəsəbə (settlement) is NOT mandatory on bina.az. If the field
+            # is absent, or anything about it fails, skip it silently and
+            # carry on with the rest of the listing.
             try:
-                has_village = await flow.page.locator(
-                    PUB_VILLAGE).first.count() > 0
+                if await flow.page.locator(PUB_VILLAGE).first.count():
+                    await _pick_list(bot, chat_id, flow, "village_button",
+                                     "Qəsəbə", tag="village", optional=True)
             except Exception:
-                has_village = False
-            if has_village:
-                await _pick_list(bot, chat_id, flow, "village_button",
-                                 "Qəsəbə", tag="village", optional=True)
+                pass
 
         address = await ask.ask_text(bot, chat_id,
                                      "Ünvanı daxil edin:")
