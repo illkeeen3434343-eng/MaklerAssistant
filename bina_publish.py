@@ -292,7 +292,12 @@ class PublishFlow:
     #     <span data-cy="city">Bakı</span>
     #   </label>
     OPTION_ROW = "label[data-cy='radio-container']"
-    OPTION_TEXT = "[data-cy='city']"          # the label text span (same for all 3)
+    # The label text span. Confirmed from real pages:
+    #   city     -> <span data-cy="city">Bakı</span>      (name="search-city")
+    #   district -> <span data-cy="location">Xətai</span> (name="select-location")
+    # 'region'/'village' are included defensively for other field variants.
+    OPTION_TEXT = ("[data-cy='city'], [data-cy='location'], "
+                   "[data-cy='region'], [data-cy='village']")          # the label text span (same for all 3)
 
     async def type_in_open(self, tag: str, query: str) -> list[str]:
         """Type into an ALREADY-OPEN dropdown's own search box and read options.

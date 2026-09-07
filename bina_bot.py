@@ -42,7 +42,8 @@ from bina_core import BinaSession, LoginError, mask
 from security import OwnershipError
 
 from ask_broker import broker as ask, Cancelled
-from bina_publish import PublishFlow, PublishError
+from bina_publish import PublishFlow, PublishError, PUB
+PUB_VILLAGE = PUB["village_button"]
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
@@ -1466,8 +1467,16 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                 await _select_on_page(bot, chat_id, flow, "district_button",
                                       "Rayon", district, tag="district",
                                       already_open=True)
-            await _pick_list(bot, chat_id, flow, "village_button",
-                             "Qəsəbə", tag="village", optional=True)
+            # Qəsəbə is optional and often absent — only try it if the opener
+            # actually exists, otherwise it raises a confusing click error.
+            try:
+                has_village = await flow.page.locator(
+                    PUB_VILLAGE).first.count() > 0
+            except Exception:
+                has_village = False
+            if has_village:
+                await _pick_list(bot, chat_id, flow, "village_button",
+                                 "Qəsəbə", tag="village", optional=True)
 
         address = await ask.ask_text(bot, chat_id,
                                      "Ünvanı daxil edin:")
