@@ -204,7 +204,10 @@ class PublishFlow:
     # -------------------------------------------------------------- steps
     async def open_new_ad(self):
         await self.page.goto(NEW_AD_URL, wait_until="domcontentloaded")
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # bina.az ads/analytics never go idle
         await asyncio.sleep(1.5)
         low = self.page.url.lower()
         if "login" in low or "hello.bina.az" in low:
@@ -219,7 +222,10 @@ class PublishFlow:
         by id so nothing is missed.
         """
         await self.page.goto(MY_ADS_URL, wait_until="domcontentloaded")
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # bina.az ads/analytics never go idle
         await asyncio.sleep(2.5)
         low = self.page.url.lower()
         if "login" in low or "hello.bina.az" in low or "authentication" in low:
@@ -685,12 +691,29 @@ class PublishFlow:
     async def submit(self) -> str:
         """Click 'Davam etmək'. Returns the URL we land on afterwards.
 
-        NOTE: this is 'Continue', not necessarily the final publish — there is
-        very likely a package/preview step after it. The caller should inspect
-        the returned URL / page.
+        bina.az keeps ads/analytics polling forever, so it NEVER reaches
+        'networkidle'. Waiting for that state blew the 30s timeout and crashed
+        the wizard *after* the ad had already been submitted. We now wait for
+        the navigation itself (with a bound) and fall back to a plain sleep.
         """
+        before = self.page.url
         await self._click(PUB["submit"], "submit")
-        await self.page.wait_for_load_state("networkidle")
+
+        # wait for the URL to change (or the form to disappear), bounded
+        for _ in range(24):                       # up to ~12s
+            await asyncio.sleep(0.5)
+            try:
+                if self.page.url != before:
+                    break
+                if not await self.page.locator(PUB["submit"]).count():
+                    break
+            except Exception:
+                break
+
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
         await asyncio.sleep(2.0)
         await self.s.snapshot("publish-after-continue")
         return self.page.url

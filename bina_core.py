@@ -277,7 +277,10 @@ class BinaSession:
         """
         # 1) homepage
         await self._page.goto(HOME_URL, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle")
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # bina.az ads/analytics never go idle
         await self._pause()
 
         # If a phone field is already visible (rare), done.
@@ -291,7 +294,10 @@ class BinaSession:
         # 3) click 'Telefon nömrəsi ilə giriş' (opens hello.bina.az phone page)
         await self._click_first(PHONE_CHOICES)
         await asyncio.sleep(2.0)
-        await self._page.wait_for_load_state("networkidle")
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # bina.az ads/analytics never go idle
 
         # 4) the phone page may open as a new tab/window — switch to it
         try:
@@ -308,7 +314,10 @@ class BinaSession:
 
         # 5) fallback: navigate to the auth URL directly
         await self._page.goto(AUTH_URL, wait_until="domcontentloaded")
-        await self._page.wait_for_load_state("networkidle")
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # bina.az ads/analytics never go idle
         await self._pause()
         return await self._visible(SELECTORS["phone_input"], timeout=6000)
 
@@ -344,7 +353,10 @@ class BinaSession:
             await asyncio.sleep(0.4)
         if not await self._click_first([SELECTORS["phone_submit"]] + SUBMIT_BUTTONS):
             await field.press("Enter")
-        await self._page.wait_for_load_state("networkidle")
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # bina.az ads/analytics never go idle
         await self._pause()
         # Wait for the OTP field to actually appear before we ask the user.
         return await self._wait_for_otp_field()

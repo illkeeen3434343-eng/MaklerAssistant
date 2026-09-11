@@ -250,6 +250,19 @@ def admin_menu() -> ReplyKeyboardMarkup:
 
 # Tracks each user's currently-active bina.az number.
 
+
+async def _busy(bot, chat_id: int, text: str):
+    """Tell the user the browser is working.
+
+    Every wizard step drives a real page, which takes a few seconds. Without
+    this the bot looks frozen between questions.
+    """
+    try:
+        await bot.send_message(chat_id, f"⏳ {text}")
+    except Exception:
+        pass
+
+
 def _safe(text) -> str:
     """Escape text for Telegram HTML parse_mode.
 
@@ -1315,7 +1328,7 @@ async def cb_newlisting(call: CallbackQuery, bot: Bot, state: FSMContext):
             await bot.send_message(chat_id, "⏰ Cavab gözləmə müddəti bitdi.", reply_markup=main_menu())
         except Exception as exc:
             log.exception("publish wizard error")
-            await bot.send_message(chat_id, f"💥 {exc}", reply_markup=main_menu())
+            await bot.send_message(chat_id, f"💥 {_safe(exc)}", reply_markup=main_menu())
 
 
 async def _choose_from_dropdown(bot, chat_id, flow, opener_key, prompt,
@@ -1459,6 +1472,7 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         #                             ("Vasitəçi", "agent")])
         # is_owner = who == "owner"
         is_owner = False          # default: agent (Mən vasitəçiyəm)
+        await _busy(bot, chat_id, "Elan növü seçilir…")
         await flow.choose_owner(is_owner)
 
         # City — ask which city, but SKIP touching the page when bina.az has
@@ -1469,6 +1483,7 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         if already and already.casefold() == (city or "").casefold():
             await bot.send_message(chat_id, f"🏙 Şəhər artıq seçilib: <b>{already}</b>")
         else:
+            await _busy(bot, chat_id, "Şəhər seçilir…")
             await _select_on_page(bot, chat_id, flow, "city_button", "Şəhər",
                                   city, tag="city")
 
@@ -1477,6 +1492,7 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
             district = await _ask_from_list(bot, chat_id, "Rayon",
                                             BAKU_DISTRICTS,
                                             page_size=len(BAKU_DISTRICTS))
+            await _busy(bot, chat_id, "Rayon siyahısı açılır…")
             if not await flow.open_district():
                 await bot.send_message(
                     chat_id, "⚠️ Rayon siyahısı açılmadı. /debug yazıb "
@@ -1519,17 +1535,22 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
                                   "Elan barədə açıqlamanı qeyd edin:")
         price = await ask.ask_text(bot, chat_id, "Mənzilin satış qiymətini daxil edin:")
 
+        await _busy(bot, chat_id, "Məlumatlar doldurulur…")
         await flow.fill_details(address=address, rooms=rooms, area=area, floor=floor,
                                 total_floors=total, description=desc, price=price)
 
         # optional checkboxes
-        extras = await ask.ask_choice(bot, chat_id, "Bunlardan hər hansı biri varmı?",
-                                      [("Çıxarış var", "bill"),
-                                       ("İpoteka var", "mortgage"),
-                                       ("Heç biri", "none")])
-        if extras == "bill":
+        has_bill = await ask.ask_choice(bot, chat_id, "Çıxarış varmı?",
+                                        [("Var", "yes"), ("Yoxdur", "no")])
+        if has_bill == "yes":
+            await _busy(bot, chat_id, "Çıxarış qeyd olunur…")
             await flow.set_checkbox("bill_of_sale", True)
-        elif extras == "mortgage":
+
+        has_mortgage = await ask.ask_choice(bot, chat_id, "İpotekaya yararlıdırmı?",
+                                            [("Uyğundur", "yes"),
+                                             ("Uyğun deyil", "no")])
+        if has_mortgage == "yes":
+            await _busy(bot, chat_id, "İpoteka qeyd olunur…")
             await flow.set_checkbox("mortgage", True)
 
         # photos (min 4, max 30)
@@ -1556,24 +1577,32 @@ async def publish_wizard(bot: Bot, chat_id: int, sess: BinaSession):
         await flow.fill_contact(name=name, email=email, is_owner=is_owner)
 
         # review + submit
+        cat_az = {"new": "Yeni tikili", "old": "Köhnə tikili"}.get(cat, cat)
+        repair_az = {"yes": "Təmirli", "no": "Təmirsiz"}.get(repair, repair)
+        bill_az = "Var" if has_bill == "yes" else "Yoxdur"
+        mortgage_az = "Uyğundur" if has_mortgage == "yes" else "Uyğun deyil"
         summary = (f"<b>Yoxlama</b>\n"
-                   f"• {cat} · Sell\n"
-                   f"• {city} · {rooms} rooms · {area} m² · floor {floor}/{total}\n"
-                   f"• Repair: {repair} · Price: {price} AZN\n"
-                   f"• {len(photos)} photos\n\n"
-                   f"Tap Continue to submit (bina.az may then show a package step).")
+                   f"• Əmlakın növü: {cat_az} · Satıram\n"
+                   f"• Yer: {city}\n"
+                   f"• Otaq sayı: {rooms} · Sahə: {area} m²\n"
+                   f"• Mərtəbə: {floor}/{total} · Təmir: {repair_az}\n"
+                   f"• Qiymət: {price} AZN\n"
+                   f"• Çıxarış: {bill_az} · İpoteka: {mortgage_az}\n"
+                   f"• Şəkil sayı: {len(photos)}\n\n"
+                   f"Elanı göndərmək üçün <b>Davam etmək</b> düyməsinə basın.")
         go = await ask.ask_choice(bot, chat_id, summary,
                                   [("▶️ Davam etmək", "go")])
         if go != "go":
             raise Cancelled()
 
+        await _busy(bot, chat_id, "Elan göndərilir…")
         final_url = await flow.submit()
 
     await bot.send_message(
         chat_id,
         "✅ <b>Elan göndərildi!</b>\n\n"
-        "Your ad has been sent to bina.az for review. Once their moderators "
-        "approve it, it goes live on the site.\n\n"
+        "Elanınız yoxlama üçün bina.az-a göndərildi. Moderatorlar təsdiq "
+        "etdikdən sonra saytda dərc olunacaq.\n\n"
         "Statusu istənilən vaxt 📋 Elanlarım ilə yoxlayın.",
         reply_markup=main_menu())
 
@@ -1624,7 +1653,7 @@ async def ensure_login(bot: Bot, chat_id: int, user_id: int, phone: str,
             return False
         except Exception as exc:
             log.exception("login error")
-            await bot.send_message(chat_id, f"💥 {exc}", reply_markup=main_menu())
+            await bot.send_message(chat_id, f"💥 {_safe(exc)}", reply_markup=main_menu())
             return False
     # Only mention a reused session when the user explicitly tapped Login.
     if not fresh and announce_reused:
