@@ -202,6 +202,7 @@ BTN_A_USERS = "👥 Bütün istifadəçilər"
 BTN_A_SETSTATUS = "✅ Status təyin et"
 BTN_A_SETTIER = "⭐ Tarif təyin et"
 BTN_A_STATS = "📊 Statistika"
+BTN_A_BROADCAST = "📢 Hamıya mesaj"
 BTN_A_BACK = "⬅️ Geri"
 
 
@@ -240,7 +241,8 @@ def admin_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_A_PENDING), KeyboardButton(text=BTN_A_USERS)],
             [KeyboardButton(text=BTN_A_SETSTATUS), KeyboardButton(text=BTN_A_SETTIER)],
-            [KeyboardButton(text=BTN_A_STATS)],
+            [KeyboardButton(text=BTN_A_STATS),
+             KeyboardButton(text=BTN_A_BROADCAST)],
             [KeyboardButton(text=BTN_A_BACK)],
         ],
         resize_keyboard=True,
@@ -460,7 +462,7 @@ async def wizard_photo(msg: Message, bot: Bot, state: FSMContext):
 
 
 MENU_TEXTS = {BTN_LOGIN, BTN_NEW, BTN_ADS, BTN_STATUS, BTN_SESSIONS, BTN_ADMIN,
-              BTN_HELP, BTN_A_STATS,
+              BTN_HELP, BTN_A_STATS, BTN_A_BROADCAST,
               BTN_S_NEW, BTN_S_SWITCH, BTN_S_LIST, BTN_S_FORGET, BTN_S_REMOVE,
               BTN_CONTACT,
               BTN_A_PENDING, BTN_A_USERS, BTN_A_SETSTATUS, BTN_A_SETTIER, BTN_A_BACK}
@@ -792,6 +794,122 @@ async def kb_admin_stats(msg: Message):
     await msg.answer("\n".join(lines)[:3800], reply_markup=admin_menu())
 
 
+# ==================== ELAN İDARƏSİ (/elan_<id>) ====================
+# Which fields live under each section of the bina.az edit form.
+EDIT_SECTIONS = {
+    "loc":   ("Yerləşmə yeri", [("Ünvan (dəqiq yerləşmə)", "address")]),
+    "prop":  ("Əmlak haqqında", [("Otaq sayı", "rooms"), ("Sahə, m²", "area"),
+                                 ("Mərtəbə", "floor"),
+                                 ("Mərtəbələrin sayı", "total"),
+                                 ("Təmir", "repair")]),
+    "desc":  ("Əlavə məlumat", [("Əlavə məlumat", "description")]),
+    "price": ("Qiymət", [("Qiymət", "price")]),
+}
+
+
+@dp.message(F.text.regexp(r"^/elan_(\d+)$"))
+async def ad_actions(msg: Message, bot: Bot, state: FSMContext):
+    ad_id = msg.text.strip().split("_", 1)[1]
+    uid = msg.from_user.id
+    phone = phone_for(None)
+    if not phone:
+        await msg.answer("Əvvəlcə nömrə daxil edin (🔑 Giriş).")
+        return
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Məşğul — əvvəlki əməliyyatı bitirin.")
+        return
+
+    async with lock_for(chat_id):
+        try:
+            action = await ask.ask_choice(
+                bot, chat_id, f"№{ad_id} — nə etmək istəyirsiniz?",
+                [("✏️ Redaktə et", "edit"), ("🗑 Sil", "del")])
+
+            if action == "del":
+                sure = await ask.ask_choice(
+                    bot, chat_id,
+                    "Bu elanı silmək istədiyinizə əminsiniz?",
+                    [("Bəli, silinsin", "yes"), ("Xeyr, silinməsin", "no")])
+                if sure != "yes":
+                    await bot.send_message(chat_id, "Ləğv edildi.",
+                                           reply_markup=main_menu(uid))
+                    return
+                if not await ensure_login(bot, chat_id, uid, phone, state):
+                    return
+                sess = get_session(uid, phone)
+                await _busy(bot, chat_id, "Elan silinir…")
+                async with sess.lock:
+                    await PublishFlow(sess).delete_ad(ad_id)
+                await bot.send_message(
+                    chat_id, f"🗑 №{ad_id} silindi.\n\n"
+                             "<i>Silinən elan bina.az-da «Vaxtı bitmiş» "
+                             "bölməsinə keçir.</i>",
+                    reply_markup=main_menu(uid))
+                return
+
+            # ---------- redaktə ----------
+            sec = await ask.ask_choice(
+                bot, chat_id, f"№{ad_id} — hansı hissəni dəyişmək istəyirsiniz?",
+                [(EDIT_SECTIONS[k][0], k) for k in
+                 ("loc", "prop", "desc", "price")])
+            label, fields = EDIT_SECTIONS[sec]
+
+            if len(fields) == 1:
+                field_label, field = fields[0]
+            else:
+                field = await ask.ask_choice(
+                    bot, chat_id, f"{label} — hansı sahə?",
+                    [(t, f) for t, f in fields])
+                field_label = dict((f, t) for t, f in fields)[field]
+
+            if field == "repair":
+                value = await ask.ask_choice(bot, chat_id, "Təmir:",
+                                             [("Təmirli", "yes"),
+                                              ("Təmirsiz", "no")])
+            else:
+                value = (await ask.ask_text(
+                    bot, chat_id, f"{field_label} — yeni dəyəri yazın:")).strip()
+                if not value:
+                    await bot.send_message(chat_id, "Boş dəyər — ləğv edildi.",
+                                           reply_markup=main_menu(uid))
+                    return
+
+            if not await ensure_login(bot, chat_id, uid, phone, state):
+                return
+            sess = get_session(uid, phone)
+            await _busy(bot, chat_id, "Redaktə səhifəsi açılır…")
+            async with sess.lock:
+                flow = PublishFlow(sess)
+                await flow.open_edit(ad_id)
+                await _busy(bot, chat_id, f"{field_label} yenilənir…")
+                await flow.edit_value(field, value)
+                await flow.submit_edit()
+            shown = {"yes": "Təmirli", "no": "Təmirsiz"}.get(value, value)
+            await bot.send_message(
+                chat_id,
+                f"✅ №{ad_id} yeniləndi.\n<b>{field_label}</b>: {shown}\n\n"
+                "<i>bina.az-da elanı 24 saat ərzində yalnız 2 dəfə redaktə "
+                "etmək mümkündür.</i>",
+                reply_markup=main_menu(uid))
+
+        except Cancelled:
+            await bot.send_message(chat_id, "Ləğv edildi.",
+                                   reply_markup=main_menu(uid))
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Vaxt bitdi.",
+                                   reply_markup=main_menu(uid))
+        except PublishError as exc:
+            await bot.send_message(chat_id, f"❌ {_safe(exc)}",
+                                   reply_markup=main_menu(uid))
+            await report_error_to_admins(bot, uid, f"elan {ad_id}", exc)
+        except Exception as exc:
+            log.exception("ad action")
+            await bot.send_message(chat_id, f"💥 {_safe(exc)}",
+                                   reply_markup=main_menu(uid))
+            await report_error_to_admins(bot, uid, f"elan {ad_id}", exc)
+
+
 # ==================== ADMIN PANEL (#5, #6, #7) ====================
 def _is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
@@ -1091,6 +1209,71 @@ async def _admin_message_user(bot: Bot, chat_id: int, target: int):
         "✅ Göndərildi." if ok else "⚠️ İstifadəçiyə çatdırıla bilmədi "
                                     "(botu bloklamış ola bilər).",
         reply_markup=admin_menu())
+
+@dp.message(F.text == BTN_A_BROADCAST)
+async def kb_admin_broadcast(msg: Message, bot: Bot):
+    """Send one message (text OR photo) to every ACTIVE user."""
+    if not _is_admin(msg.from_user.id):
+        return
+    chat_id = msg.chat.id
+    if lock_for(chat_id).locked():
+        await msg.answer("⏳ Məşğul — əvvəlki əməliyyatı bitirin.")
+        return
+
+    targets = [int(u) for u, r in U.all_users().items()
+               if r.get("status") == "active"]
+    if not targets:
+        await msg.answer("Aktiv istifadəçi yoxdur.", reply_markup=admin_menu())
+        return
+
+    async with lock_for(chat_id):
+        try:
+            await bot.send_message(
+                chat_id,
+                f"📢 <b>Hamıya mesaj</b>\n"
+                f"Aktiv istifadəçi sayı: <b>{len(targets)}</b>\n\n"
+                "Göndəriləcək mesajı yazın — <b>şəkil də göndərə bilərsiniz</b>.")
+            got = await ask.ask_message(bot, chat_id)
+            if got is None:
+                await bot.send_message(chat_id, "Ləğv edildi.",
+                                       reply_markup=admin_menu())
+                return
+            kind, payload, caption = got
+
+            confirm = await ask.ask_choice(
+                bot, chat_id,
+                f"{len(targets)} aktiv istifadəçiyə göndərilsin?",
+                [("Bəli, göndər", "yes"), ("Xeyr", "no")])
+            if confirm != "yes":
+                await bot.send_message(chat_id, "Ləğv edildi.",
+                                       reply_markup=admin_menu())
+                return
+
+            sent = failed = 0
+            for uid in targets:
+                try:
+                    if kind == "photo":
+                        await bot.send_photo(
+                            uid, payload,
+                            caption=f"📢 <b>Admindən elan</b>\n\n{caption}"[:1024])
+                    else:
+                        await bot.send_message(
+                            uid, f"📢 <b>Admindən elan</b>\n\n{payload}")
+                    sent += 1
+                except Exception:
+                    failed += 1
+                await asyncio.sleep(0.05)      # stay under Telegram rate limits
+
+            await bot.send_message(
+                chat_id,
+                f"✅ Göndərildi: <b>{sent}</b>" +
+                (f" · çatdırılmadı: <b>{failed}</b>" if failed else ""),
+                reply_markup=admin_menu())
+        except Cancelled:
+            await bot.send_message(chat_id, "Ləğv edildi.", reply_markup=admin_menu())
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id, "⏰ Vaxt bitdi.", reply_markup=admin_menu())
+
 # ==================== END ADMIN PANEL ====================
 
 
@@ -1142,21 +1325,25 @@ async def kb_ads(msg: Message, bot: Bot, state: FSMContext):
         await bot.send_message(chat_id, "Bu hesabda heç bir elan yoxdur.",
                                reply_markup=main_menu())
         return
-    lines = [f"📋 <b>Your ads ({len(ads)})</b> — {mask(phone)}", ""]
+    lines = [f"📋 <b>Elanlarınız ({len(ads)})</b> — {mask(phone)}",
+             "İdarə etmək üçün elanın nömrəsinə toxunun:", ""]
     for a in ads:
-        line = f"🏠 <b>{a.get('title') or 'Ad'}</b>"
+        line = f"🏠 <b>{a.get('title') or 'Elan'}</b>"
         if a.get("price"):
             line += f" — {a['price']} ₼"
         lines.append(line)
         if a.get("params"):
             lines.append(f"   {a['params']}")
-        meta = []
+        status = (a.get("status") or "").strip()
         if a.get("id"):
-            meta.append(f"id {a['id']}")
-        if a.get("status"):
-            meta.append(a["status"])
-        if meta:
-            lines.append("   " + " · ".join(meta))
+            # /elan_<id> renders as a tappable command in Telegram.
+            # Rejected ads have no actions on bina.az, so no link for them.
+            if "qəbul olunmayan" in status.casefold():
+                lines.append(f"   №{a['id']} · {status}")
+            else:
+                lines.append(f"   /elan_{a['id']}" + (f" · {status}" if status else ""))
+        elif status:
+            lines.append(f"   {status}")
         lines.append("")
     # chunk to stay under Telegram's 4096 limit
     buf = ""

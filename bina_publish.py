@@ -61,7 +61,14 @@ PUB = {
     "contact_agent_tab": "#quick-links-tab-new-ad-form-agent",         # confirmed
     "name": "input[name='name']",                                     # confirmed
     "email": "input[name='email']",                                   # confirmed
-    "submit": "button[data-cy='new-ad-form-submit-button']",           # confirmed ("Davam etmək")
+    "submit": "button[data-cy='new-ad-form-submit-button']",
+    # ---- My-ads card actions (profile page) ----
+    "card_dots": "button[aria-label='More options']",
+    "card_actions": "[data-cy='profile-item-card-actions-popover']",
+    "remove_accept": "[data-cy='information-popup-accept-button']",
+    "remove_popup": "#current-item-remove-popup",
+    # ---- edit form ----
+    "edit_submit": "[data-cy='edit-ad-form-submit-button']",           # confirmed ("Davam etmək")
 }
 
 # Candidate selectors for OPTION items inside an opened dropdown. These are
@@ -716,4 +723,127 @@ class PublishFlow:
             pass
         await asyncio.sleep(2.0)
         await self.s.snapshot("publish-after-continue")
+        return self.page.url
+
+    # ==================== My-ads: delete / edit ====================
+    async def _find_card(self, ad_id: str):
+        """The profile card for one ad id."""
+        await self.page.goto(MY_ADS_URL, wait_until="domcontentloaded")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        card = self.page.locator(
+            f"[data-cy='item-card']:has(a[href*='/items/{ad_id}'])").first
+        if not await card.count():
+            raise PublishError(f"Elan tapılmadı (№{ad_id}).")
+        return card
+
+    async def delete_ad(self, ad_id: str) -> bool:
+        """Delete one ad: three-dots -> 'Sil' -> confirm popup 'Sil'.
+
+        Confirmed markup:
+          dots   : button[aria-label='More options'] inside the card
+          menu   : [data-cy='profile-item-card-actions-popover'] > spans
+                   ('Düzəliş et', 'Sil')
+          popup  : #current-item-remove-popup
+                   accept [data-cy='information-popup-accept-button'] = 'Sil'
+        """
+        card = await self._find_card(ad_id)
+
+        dots = card.locator(PUB["card_dots"]).first
+        if not await dots.count():
+            raise PublishError(
+                "Bu elanı silmək mümkün deyil (qəbul olunmayan elanlar üçün "
+                "silmə düyməsi yoxdur).")
+        await dots.scroll_into_view_if_needed(timeout=4000)
+        try:
+            await dots.click(timeout=5000)
+        except Exception:
+            await dots.click(timeout=4000, force=True)
+        await asyncio.sleep(1.0)
+
+        # click the 'Sil' entry in the popover (exact text match)
+        clicked = await self.page.evaluate(
+            """(sel) => {
+                for (const box of document.querySelectorAll(sel)) {
+                    for (const el of box.querySelectorAll('span,div')) {
+                        if ((el.textContent||'').trim() === 'Sil') {
+                            el.click(); return true;
+                        }
+                    }
+                } return false;
+            }""", PUB["card_actions"])
+        if not clicked:
+            await self.s.snapshot("delete-no-menu")
+            raise PublishError("Silmə menyusu açılmadı.")
+        await asyncio.sleep(1.2)
+
+        # confirm popup
+        try:
+            accept = self.page.locator(PUB["remove_accept"]).first
+            await accept.wait_for(state="visible", timeout=8000)
+            try:
+                await accept.click(timeout=5000)
+            except Exception:
+                await accept.click(timeout=4000, force=True)
+        except Exception:
+            await self.s.snapshot("delete-no-popup")
+            raise PublishError("Təsdiq pəncərəsi açılmadı.")
+
+        await asyncio.sleep(2.5)
+        await self.s.snapshot("after-delete")
+        return True
+
+    async def open_edit(self, ad_id: str) -> bool:
+        """Open bina.az/items/<id>/edit."""
+        await self.page.goto(f"https://bina.az/items/{ad_id}/edit",
+                             wait_until="domcontentloaded")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+        low = (self.page.url or "").lower()
+        if "/edit" not in low:
+            await self.s.snapshot("edit-not-open")
+            raise PublishError("Redaktə səhifəsi açılmadı.")
+        return True
+
+    async def edit_value(self, field: str, value: str):
+        """Set one field on the edit form. Field names match the wizard."""
+        if field == "description":
+            await self._fill_textarea(value)
+            return
+        if field == "repair":
+            key = "repair_yes" if str(value).lower() in ("yes", "təmirli") else "repair_no"
+            await self._click(PUB[key], f"edit-{field}")
+            return
+        sel = {"address": PUB["address"], "rooms": PUB["rooms"],
+               "area": PUB["area"], "floor": PUB["floor"],
+               "total": PUB["total_floors"], "price": PUB["price"]}.get(field)
+        if not sel:
+            raise PublishError(f"Naməlum sahə: {field}")
+        await self._fill(sel, str(value), f"edit-{field}")
+
+    async def submit_edit(self) -> str:
+        """Click 'Davam etmək' on the edit form (bounded, never hangs)."""
+        before = self.page.url
+        await self._click(PUB["edit_submit"], "edit-submit")
+        for _ in range(24):
+            await asyncio.sleep(0.5)
+            try:
+                if self.page.url != before:
+                    break
+                if not await self.page.locator(PUB["edit_submit"]).count():
+                    break
+            except Exception:
+                break
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        await self.s.snapshot("after-edit")
         return self.page.url
