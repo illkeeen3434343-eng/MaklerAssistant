@@ -1390,7 +1390,9 @@ async def wizard_text(msg: Message, state: FSMContext):
         return
     if await state.get_state() is not None:
         return
-    if ask.waiting_kind(msg.chat.id) in ("text", "choice"):
+    # "message" = admin broadcast / admin->user note (text OR photo). It was
+    # missing here, so typed text was dropped and ask_message() timed out.
+    if ask.waiting_kind(msg.chat.id) in ("text", "choice", "message"):
         ask.feed_text(msg.chat.id, msg.text)
 
 
